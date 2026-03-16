@@ -1,14 +1,13 @@
 """
-map_utils.py — Load EU27 country boundaries and compute centroids.
+map_utils.py — Load EU27 country boundaries and provide publication-quality basemap.
 Uses the Natural Earth 110m admin-0 countries shapefile.
-Downloaded once from naciscdn.org and cached in data/ne_110m_admin_0_countries/.
 """
 
 import os
 import urllib.request
 import zipfile
-import tempfile
 import geopandas as gpd
+import matplotlib
 
 EU27_ISO = [
     'AT', 'BE', 'BG', 'CY', 'CZ', 'DE', 'DK', 'EE', 'ES', 'FI',
@@ -28,32 +27,29 @@ ISO_SHORT = {
     'SE': 'Sweden',      'SI': 'Slovenia',   'SK': 'Slovakia',
 }
 
-# Manual centroid overrides for small/island/landlocked countries
-# where automatic centroid may be inaccurate or the country absent from lowres
 CENTROID_OVERRIDES = {
-    'Cyprus':     (33.0,  35.1),   # island, may be absent from 110m
-    'Malta':      (14.4,  35.9),   # too small for 110m shapefile
-    'Luxembourg': (6.13, 49.81),   # very small country
-    'France':     (2.35, 46.5),    # ISO_A2=-99 in NE 110m; use override as fallback
+    'Cyprus':     (33.0,  35.1),
+    'Malta':      (14.4,  35.9),
+    'Luxembourg': (6.13, 49.81),
+    'France':     (2.35, 46.5),
 }
-
 
 NE_URL = (
     "https://naciscdn.org/naturalearth/110m/cultural/"
     "ne_110m_admin_0_countries.zip"
 )
 
-# Cache directory relative to this file: ../data/ne_110m/
-_HERE = os.path.dirname(os.path.abspath(__file__))
+_HERE      = os.path.dirname(os.path.abspath(__file__))
 _CACHE_DIR = os.path.join(_HERE, '..', 'data', 'ne_110m')
+
+# Cached world GDF (loaded once)
+_world_gdf_cache = None
 
 
 def _get_shapefile_path():
-    """Download Natural Earth 110m countries shapefile if not cached."""
     shp = os.path.join(_CACHE_DIR, 'ne_110m_admin_0_countries.shp')
     if os.path.exists(shp):
         return shp
-
     print("Downloading Natural Earth 110m countries shapefile (~500 KB)...")
     os.makedirs(_CACHE_DIR, exist_ok=True)
     zip_path = os.path.join(_CACHE_DIR, 'ne_110m_admin_0_countries.zip')
@@ -65,33 +61,46 @@ def _get_shapefile_path():
     return shp
 
 
-def load_eu_map():
-    """
-    Load EU27 country geometries from Natural Earth 110m.
-    Shapefile is downloaded on first run and cached in data/ne_110m/.
-
-    Returns a GeoDataFrame with columns: iso_a2, name_short, geometry.
-    """
-    shp_path = _get_shapefile_path()
-    world = gpd.read_file(shp_path)
-
-    # Natural Earth 110m uses 'ISO_A2' but France (and a few others) have '-99'
-    # there; the correct code is in 'ISO_A2_EH'. Use EH as primary, fall back
-    # to standard ISO_A2 where EH is also -99.
-    if 'ISO_A2_EH' in world.columns:
-        world['iso_a2'] = world['ISO_A2_EH'].where(
-            world['ISO_A2_EH'] != '-99', world['ISO_A2']
+def _fix_iso(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Patch Natural Earth ISO_A2 so France is not '-99'."""
+    if 'ISO_A2_EH' in gdf.columns:
+        gdf = gdf.copy()
+        gdf['iso_a2'] = gdf['ISO_A2_EH'].where(
+            gdf['ISO_A2_EH'] != '-99', gdf.get('ISO_A2', '-99')
         )
     else:
-        world['iso_a2'] = world.get('ISO_A2', world.get('iso_a2', '-99'))
+        gdf = gdf.copy()
+        gdf['iso_a2'] = gdf.get('ISO_A2', '-99')
+    return gdf
 
+
+def load_eu_map() -> gpd.GeoDataFrame:
+    """
+    Load EU27 country geometries from Natural Earth 110m.
+
+    Returns GeoDataFrame with columns: iso_a2, name_short, geometry.
+    """
+    world = gpd.read_file(_get_shapefile_path())
+    world = _fix_iso(world)
     eu = world[world['iso_a2'].isin(EU27_ISO)].copy()
     eu['name_short'] = eu['iso_a2'].map(ISO_SHORT)
-    eu = eu.reset_index(drop=True)
-    return eu
+    return eu.reset_index(drop=True)
 
 
-def get_centroids(eu_gdf):
+def load_world_map() -> gpd.GeoDataFrame:
+    """
+    Load all-countries shapefile. Cached after first call.
+
+    Returns GeoDataFrame with columns: iso_a2, geometry.
+    """
+    global _world_gdf_cache
+    if _world_gdf_cache is None:
+        world = gpd.read_file(_get_shapefile_path())
+        _world_gdf_cache = _fix_iso(world).reset_index(drop=True)
+    return _world_gdf_cache
+
+
+def get_centroids(eu_gdf: gpd.GeoDataFrame) -> dict:
     """
     Compute geographic centroids for each EU27 country.
 
@@ -104,9 +113,82 @@ def get_centroids(eu_gdf):
         if name:
             c = row['geometry'].centroid
             centroids[name] = (c.x, c.y)
-
-    # Apply overrides (and fill in missing countries)
     for name, xy in CENTROID_OVERRIDES.items():
         centroids[name] = xy
-
     return centroids
+
+
+def render_basemap(
+    ax: matplotlib.axes.Axes,
+    eu_gdf: gpd.GeoDataFrame,
+    world_gdf: gpd.GeoDataFrame = None,
+    highlighted_countries: list = None,
+    xlim: tuple = (-25, 45),
+    ylim: tuple = (34, 72),
+) -> None:
+    """
+    Draw a publication-quality EU basemap onto ax.
+
+    Parameters
+    ----------
+    eu_gdf               : EU27 GeoDataFrame (from load_eu_map)
+    world_gdf            : full world GeoDataFrame (from load_world_map); if None
+                           only EU countries are drawn
+    highlighted_countries: country short names to render with a distinct fill
+                           (e.g. currently selected source countries)
+    xlim, ylim           : geographic bounding box [lon, lat]
+    """
+    ax.set_facecolor('#c8dff0')   # ocean blue
+
+    # ── non-EU context countries ─────────────────────────────────────────
+    if world_gdf is not None:
+        non_eu = world_gdf[~world_gdf['iso_a2'].isin(EU27_ISO)]
+        non_eu.plot(
+            ax=ax, color='#e0ddd5', edgecolor='#b0b0a8',
+            linewidth=0.3, zorder=1
+        )
+
+    # ── EU countries ──────────────────────────────────────────────────────
+    hl = set(highlighted_countries or [])
+    if hl:
+        eu_normal = eu_gdf[~eu_gdf['name_short'].isin(hl)]
+        eu_hl     = eu_gdf[eu_gdf['name_short'].isin(hl)]
+        eu_normal.plot(ax=ax, color='#f0f4e8', edgecolor='#888888',
+                       linewidth=0.5, zorder=2)
+        eu_hl.plot(ax=ax, color='#fffde8', edgecolor='#999966',
+                   linewidth=0.8, zorder=2)
+    else:
+        eu_gdf.plot(ax=ax, color='#f0f4e8', edgecolor='#888888',
+                    linewidth=0.5, zorder=2)
+
+    # ── ISO-2 labels ──────────────────────────────────────────────────────
+    centroids = get_centroids(eu_gdf)
+    short_to_iso = {v: k for k, v in ISO_SHORT.items()}
+    x0, x1 = xlim
+    y0, y1 = ylim
+    pad = 3.0
+    for name, (cx, cy) in centroids.items():
+        if x0 - pad < cx < x1 + pad and y0 - pad < cy < y1 + pad:
+            iso = short_to_iso.get(name, '')
+            if iso:
+                ax.text(
+                    cx, cy, iso,
+                    ha='center', va='center',
+                    fontsize=5.5, color='#444444',
+                    fontfamily='monospace', alpha=0.85,
+                    zorder=4,
+                )
+
+    # ── 10° graticule ─────────────────────────────────────────────────────
+    for lon in range(-30, 51, 10):
+        ax.axvline(lon, color='#aabbcc', linewidth=0.25, linestyle='--',
+                   alpha=0.55, zorder=1)
+    for lat in range(30, 81, 10):
+        ax.axhline(lat, color='#aabbcc', linewidth=0.25, linestyle='--',
+                   alpha=0.55, zorder=1)
+
+    # ── axis styling ─────────────────────────────────────────────────────
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_aspect('equal')
+    ax.axis('off')

@@ -54,11 +54,11 @@ def parse_label_file(label_path):
     return verbose_to_iso
 
 
-def load_trade_data(data_path, label_path):
+def load_trade_data(data_path, label_path, year=2024):
     """
     Load and clean bilateral trade data.
 
-    Filters to: PERIOD='Jan.-Dec. 2024', FLOW='EXPORT', INDICATORS='VALUE_IN_EUR'.
+    Filters to: PERIOD='Jan.-Dec. {year}', FLOW='EXPORT', INDICATORS='VALUE_IN_EUR'.
 
     Returns
     -------
@@ -71,9 +71,9 @@ def load_trade_data(data_path, label_path):
 
     df = pd.read_csv(data_path)
 
-    # Filter to 2024 gross exports in EUR
+    # Filter to the requested year's gross exports in EUR
     df = df[
-        (df['PERIOD_LAB'] == 'Jan.-Dec. 2024') &
+        (df['PERIOD_LAB'] == f'Jan.-Dec. {year}') &
         (df['FLOW_LAB'] == 'EXPORT') &
         (df['INDICATORS_LAB'] == 'VALUE_IN_EUR')
     ].copy()

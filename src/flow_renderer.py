@@ -1,15 +1,14 @@
 """
 flow_renderer.py — Draw multi-source EU trade flow maps.
 
-Flows are drawn as curved arrows; line width and opacity scale with flow value.
-Each source country gets a distinct color.
+Data modes  : 'gross' (raw exports) or 'net' (exports minus imports)
+Style modes : straight arrows or spiral trees
 """
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import numpy as np
 from matplotlib.lines import Line2D
-from matplotlib.patches import FancyArrowPatch
+
+from map_utils import render_basemap
+from spiral_tree import compute_spiral_tree, draw_spiral_trees
 
 # Color palette for up to 10 source countries
 SOURCE_COLORS = [
@@ -17,101 +16,145 @@ SOURCE_COLORS = [
     '#a65628', '#f781bf', '#999999', '#66c2a5', '#fc8d62',
 ]
 
+# Spiral tree cache: (frozenset(sources), alpha_deg, threshold_meur) → trees
+_SPIRAL_CACHE: dict = {}
 
-def draw_flow_map(eu_gdf, centroids, export_matrix, sources,
-                  threshold_meur=0.0, net_mode=False, net_matrix=None,
-                  title="EU Trade Flow Map", output_path=None):
-    """
-    Render a multi-source flow map and save or display it.
 
-    Parameters
-    ----------
-    eu_gdf         : GeoDataFrame from map_utils.load_eu_map()
-    centroids      : dict {country: (lon, lat)} from map_utils.get_centroids()
-    export_matrix  : pd.DataFrame, gross export flows in million EUR
-    sources        : list[str], source country names to highlight
-    threshold_meur : float, minimum flow value to draw (million EUR)
-    net_mode       : bool, if True use net_matrix instead of export_matrix
-    net_matrix     : pd.DataFrame, net export flows (required if net_mode=True)
-    title          : str, map title
-    output_path    : str or None, if given save PNG here; else display
+def render_to_axes(
+    ax,
+    eu_gdf,
+    centroids,
+    export_matrix,
+    sources,
+    threshold_meur=0.0,
+    net_mode=False,
+    net_matrix=None,
+    title="EU Trade Flow Map",
+    spiral_mode=False,
+    alpha_deg=25.0,
+    world_gdf=None,
+    xlim=(-25, 45),
+    ylim=(34, 72),
+    highlighted_countries=None,
+) -> list:
     """
+    Draw a multi-source flow map onto an existing matplotlib Axes.
+
+    Returns
+    -------
+    list of SpiralTreeResult when spiral_mode=True; empty list otherwise.
+    """
+    ax.clear()
     matrix = net_matrix if net_mode else export_matrix
 
-    # Determine max flow value across all drawn flows for scaling
+    # ── basemap ────────────────────────────────────────────────────────────
+    render_basemap(ax, eu_gdf, world_gdf=world_gdf,
+                   highlighted_countries=highlighted_countries or list(sources),
+                   xlim=xlim, ylim=ylim)
+
+    if spiral_mode:
+        mode_label = f"Spiral Tree (α={alpha_deg:.0f}°)"
+    elif net_mode:
+        mode_label = "Net Exports"
+    else:
+        mode_label = "Gross Exports"
+
+    if title:
+        ax.set_title(
+            f"{title}\n({mode_label}, threshold ≥ {threshold_meur:.0f} M EUR)",
+            fontsize=11, pad=8
+        )
+
+    if not sources:
+        return []
+
+    color_map = {src: SOURCE_COLORS[i % len(SOURCE_COLORS)]
+                 for i, src in enumerate(sources)}
+
+    # ── Spiral Tree mode ──────────────────────────────────────────────────
+    if spiral_mode:
+        if net_matrix is None:
+            return []
+        cache_key = (frozenset(sources), alpha_deg, threshold_meur)
+        if cache_key not in _SPIRAL_CACHE:
+            trees = []
+            for src in sources:
+                if src not in net_matrix.index:
+                    continue
+                row = net_matrix.loc[src]
+                net_flows = {
+                    dst: float(v) for dst, v in row.items()
+                    if dst != src and float(v) > threshold_meur
+                }
+                if not net_flows:
+                    continue
+                result = compute_spiral_tree(
+                    source_name=src,
+                    terminal_names=list(net_flows.keys()),
+                    net_flows=net_flows,
+                    centroids=centroids,
+                    obstacle_names=[s for s in sources if s != src],
+                    alpha_deg=alpha_deg,
+                )
+                trees.append(result)
+            _SPIRAL_CACHE[cache_key] = trees
+        else:
+            trees = _SPIRAL_CACHE[cache_key]
+
+        draw_spiral_trees(ax, trees, centroids, color_map)
+
+        legend_elements = [
+            Line2D([0], [0], color=color_map[src], linewidth=2.5, label=src)
+            for src in sources if src in color_map
+        ]
+        if legend_elements:
+            ax.legend(handles=legend_elements, loc='lower left', fontsize=8,
+                      title='Source Country', title_fontsize=8,
+                      framealpha=0.85, edgecolor='#cccccc')
+        return trees
+
+    # ── Straight-arrow mode ────────────────────────────────────────────────
     max_val = 0.0
     for src in sources:
         if src not in matrix.index:
             continue
         for dst in matrix.columns:
-            if dst == src:
-                continue
-            val = matrix.loc[src, dst]
-            if net_mode:
-                val = val  # can be negative; we draw only positive (net exporter)
-            if val > threshold_meur:
-                max_val = max(max_val, val)
-
-    if max_val == 0:
-        print("No flows above threshold — nothing to draw.")
-        return
-
-    fig, ax = plt.subplots(1, 1, figsize=(14, 10))
-
-    # Draw EU country polygons
-    eu_gdf.plot(ax=ax, color='#f5f5f0', edgecolor='#888888', linewidth=0.5)
-
-    # Map extent: Europe
-    ax.set_xlim(-25, 45)
-    ax.set_ylim(34, 72)
-    ax.set_aspect('equal')
-    ax.axis('off')
+            if dst != src:
+                v = matrix.loc[src, dst]
+                if v > threshold_meur:
+                    max_val = max(max_val, v)
 
     legend_elements = []
-
     for i, src in enumerate(sources):
         color = SOURCE_COLORS[i % len(SOURCE_COLORS)]
-        legend_elements.append(
-            Line2D([0], [0], color=color, linewidth=2.5, label=src)
-        )
+        legend_elements.append(Line2D([0], [0], color=color, lw=2.5, label=src))
 
         if src not in centroids:
-            print(f"Warning: centroid not found for '{src}'")
             continue
-
         src_xy = centroids[src]
 
-        for dst in matrix.columns:
-            if dst == src or dst not in centroids:
-                continue
+        if max_val > 0:
+            for dst in matrix.columns:
+                if dst == src or dst not in centroids:
+                    continue
+                val = matrix.loc[src, dst] if src in matrix.index else 0.0
+                if val <= threshold_meur:
+                    continue
+                dst_xy = centroids[dst]
+                norm  = val / max_val
+                lw    = 0.4 + 7.0 * norm
+                alpha = 0.35 + 0.55 * norm
+                ax.annotate(
+                    "",
+                    xy=dst_xy, xytext=src_xy,
+                    arrowprops=dict(
+                        arrowstyle="-|>", color=color, lw=lw, alpha=alpha,
+                        mutation_scale=10, connectionstyle="arc3,rad=0.15",
+                    ),
+                    zorder=3,
+                )
 
-            val = matrix.loc[src, dst] if src in matrix.index else 0.0
-
-            # In net mode draw only net-positive flows (src is net exporter to dst)
-            if val <= threshold_meur:
-                continue
-
-            dst_xy = centroids[dst]
-            norm = val / max_val
-            lw = 0.4 + 7.0 * norm
-            alpha = 0.35 + 0.55 * norm
-
-            ax.annotate(
-                "",
-                xy=dst_xy,
-                xytext=src_xy,
-                arrowprops=dict(
-                    arrowstyle="-|>",
-                    color=color,
-                    lw=lw,
-                    alpha=alpha,
-                    mutation_scale=10,
-                    connectionstyle="arc3,rad=0.15",
-                ),
-                zorder=3,
-            )
-
-    # Draw source country markers on top
+    # Source markers
     for i, src in enumerate(sources):
         if src not in centroids:
             continue
@@ -123,24 +166,20 @@ def draw_flow_map(eu_gdf, centroids, export_matrix, sources,
                 fontsize=7.5, fontweight='bold', zorder=6,
                 bbox=dict(boxstyle='round,pad=0.15', fc='white', alpha=0.7, lw=0))
 
-    # Legend
-    ax.legend(handles=legend_elements, loc='lower left', fontsize=9,
-              title='Source Country', title_fontsize=9,
-              framealpha=0.85, edgecolor='#cccccc')
+    if legend_elements:
+        ax.legend(handles=legend_elements, loc='lower left', fontsize=8,
+                  title='Source Country', title_fontsize=8,
+                  framealpha=0.85, edgecolor='#cccccc')
 
-    mode_label = "Net Exports" if net_mode else "Gross Exports"
-    ax.set_title(f"{title}\n({mode_label}, threshold ≥ {threshold_meur:.0f} M EUR)",
-                 fontsize=13, pad=12)
+    if max_val > 0:
+        ax.text(0.01, 0.01,
+                f"Line width ∝ flow  |  max: {max_val:,.0f} M EUR",
+                transform=ax.transAxes, fontsize=7.5, color='#666666',
+                va='bottom')
 
-    ax.text(0.01, 0.01,
-            f"Line width ∝ flow value  |  max shown: {max_val:,.0f} M EUR",
-            transform=ax.transAxes, fontsize=8, color='#666666', va='bottom')
+    return []
 
-    plt.tight_layout()
 
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Saved: {output_path}")
-        plt.close()
-    else:
-        plt.show()
+def invalidate_spiral_cache():
+    """Clear the spiral tree cache (call after data reload or threshold change)."""
+    _SPIRAL_CACHE.clear()
