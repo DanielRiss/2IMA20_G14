@@ -3,6 +3,11 @@ interactive.py — Tkinter GUI for exploring EU trade flow maps.
 
 Launch with:
     python src/interactive.py
+
+Zoom / pan freely with the matplotlib toolbar (magnifier or hand icon).
+The overview inset (bottom-left) always shows the full EU and highlights
+the portion currently visible in the main view.  "Reset View" snaps back
+to the full EU extent.
 """
 
 import os
@@ -14,6 +19,7 @@ from tkinter import ttk, messagebox, simpledialog
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,37 +43,48 @@ EU27_COUNTRIES  = sorted(ISO_SHORT.values())
 SHORT_TO_ISO    = {v: k for k, v in ISO_SHORT.items()}
 AVAILABLE_YEARS = [2024]
 
-# ── zoom region presets (xmin, xmax, ymin, ymax) ─────────────────────────────
-ZOOM_PRESETS = {
-    'Full EU':          (-25, 45, 34, 72),
-    'Western Europe':   (-10, 15, 42, 58),
-    'Northern Europe':  (  5, 35, 54, 72),
-    'Central Europe':   (  9, 26, 45, 57),
-    'Benelux + DE/FR':  (  1, 16, 47, 56),
-    'Iberian Peninsula':(-10,  4, 35, 45),
-    'Baltic States':    ( 20, 28, 53, 61),
-}
+# ── geographic extent ─────────────────────────────────────────────────────────
+_FULL_XLIM = (-25.0, 45.0)
+_FULL_YLIM = (34.0,  72.0)
+
+
+def _is_default_view(xlim, ylim) -> bool:
+    """True if the axes are at the matplotlib-default (0,1) state (no data yet)."""
+    return abs(xlim[1] - xlim[0] - 1.0) < 0.01 and abs(xlim[0]) < 0.01
+
+
+def _has_custom_zoom(xlim, ylim) -> bool:
+    """True when the user has zoomed away from the full EU extent."""
+    if _is_default_view(xlim, ylim):
+        return False
+    return not (
+        abs(xlim[0] - _FULL_XLIM[0]) < 1.5 and
+        abs(xlim[1] - _FULL_XLIM[1]) < 1.5 and
+        abs(ylim[0] - _FULL_YLIM[0]) < 1.5 and
+        abs(ylim[1] - _FULL_YLIM[1]) < 1.5
+    )
+
 
 # ── threshold slider ──────────────────────────────────────────────────────────
 SLIDER_MAX = 200
+
 
 def slider_to_threshold(pos: int) -> float:
     if pos == 0:
         return 0.0
     return round(10 ** (pos / 40.0))
 
+
 def threshold_to_label(pos: int) -> str:
     t = slider_to_threshold(pos)
-    if t == 0:     return "0 M €"
-    if t >= 1000:  return f"{t / 1000:.0f} B €"
+    if t == 0:    return "0 M €"
+    if t >= 1000: return f"{t / 1000:.0f} B €"
     return f"{t:.0f} M €"
 
+
 def fmt_flow(val_meur: float) -> str:
-    """Format a flow value (million EUR) as a compact string."""
-    if val_meur >= 1_000_000:
-        return f"€{val_meur/1e6:.1f}T"
-    if val_meur >= 1_000:
-        return f"€{val_meur/1e3:.0f}B"
+    if val_meur >= 1_000_000: return f"€{val_meur/1e6:.1f}T"
+    if val_meur >= 1_000:     return f"€{val_meur/1e3:.0f}B"
     return f"€{val_meur:.0f}M"
 
 
@@ -86,29 +103,32 @@ class FlowMapApp:
         self.world_gdf     = None
         self.centroids     = None
 
-        # ── control variables ──────────────────────────────────────────────
-        self.data_mode_var  = tk.StringVar(value='gross')   # gross | net
-        self.style_var      = tk.StringVar(value='straight')  # straight | spiral
-        self.alpha_var      = tk.IntVar(value=25)
-        self.threshold_var  = tk.IntVar(value=0)
-        self.year_var       = tk.StringVar(value=str(AVAILABLE_YEARS[0]))
-        self.zoom_region_var = tk.StringVar(value='Full EU')
-        self.country_vars   = {c: tk.BooleanVar(value=False) for c in EU27_COUNTRIES}
+        # ── overview inset handle (recreated on every redraw) ──────────────
+        self._overview_ax  = None
+        self._in_redraw    = False   # guard against recursive callbacks
 
-        # ── groups ────────────────────────────────────────────────────────
-        # Each entry: name → {'members': [...], 'var': BooleanVar}
+        # ── control variables ──────────────────────────────────────────────
+        self.data_mode_var = tk.StringVar(value='gross')
+        self.style_var     = tk.StringVar(value='straight')
+        self.alpha_var     = tk.IntVar(value=25)
+        self.threshold_var = tk.IntVar(value=0)
+        self.year_var      = tk.StringVar(value=str(AVAILABLE_YEARS[0]))
+        self.country_vars  = {c: tk.BooleanVar(value=False) for c in EU27_COUNTRIES}
+        self.focus_var     = tk.BooleanVar(value=False)
+
+        # ── groups ─────────────────────────────────────────────────────────
         self._groups: dict = {}
-        self._group_inner_frame: tk.Frame = None  # rebuilt on group changes
+        self._group_inner_frame: tk.Frame = None
         for gname, members in DEFAULT_GROUPS.items():
             self._groups[gname] = {
                 'members': list(members),
                 'var': tk.BooleanVar(value=False),
             }
 
-        # ── stats state ───────────────────────────────────────────────────
+        # ── stats state ────────────────────────────────────────────────────
         self._current_trees = []
-
         self._redraw_after_id = None
+
         self._build_ui()
         self._load_data()
 
@@ -136,11 +156,11 @@ class FlowMapApp:
         year_cb.bind('<<ComboboxSelected>>', self._on_year_change)
 
         # Data mode
-        df = ttk.LabelFrame(ctrl, text="Data Mode", padding=4)
-        df.pack(fill='x', pady=2)
-        ttk.Radiobutton(df, text="Gross Exports", variable=self.data_mode_var,
+        mf = ttk.LabelFrame(ctrl, text="Data Mode", padding=4)
+        mf.pack(fill='x', pady=2)
+        ttk.Radiobutton(mf, text="Gross Exports", variable=self.data_mode_var,
                         value='gross', command=self._schedule_redraw).pack(anchor='w')
-        ttk.Radiobutton(df, text="Net Flows",     variable=self.data_mode_var,
+        ttk.Radiobutton(mf, text="Net Flows",     variable=self.data_mode_var,
                         value='net',   command=self._schedule_redraw).pack(anchor='w')
 
         # Rendering style
@@ -151,7 +171,7 @@ class FlowMapApp:
         ttk.Radiobutton(sf, text="Spiral Trees",    variable=self.style_var,
                         value='spiral',   command=self._on_style_change).pack(anchor='w')
 
-        # Alpha slider (hidden unless Spiral Trees is selected)
+        # Alpha slider (only visible in spiral mode)
         self.alpha_frame = ttk.LabelFrame(ctrl, text="Restricting Angle α (°)", padding=4)
         self.alpha_label = ttk.Label(self.alpha_frame, text="25°")
         self.alpha_label.pack(anchor='w')
@@ -177,24 +197,21 @@ class FlowMapApp:
         self.groups_outer.pack(fill='x', pady=2)
         self._rebuild_groups_panel()
 
-        # Zoom region
-        zf = ttk.LabelFrame(ctrl, text="Zoom Region", padding=4)
-        zf.pack(fill='x', pady=2)
-        zoom_cb = ttk.Combobox(zf, textvariable=self.zoom_region_var,
-                               values=list(ZOOM_PRESETS.keys()),
-                               state='readonly', width=20)
-        zoom_cb.pack(anchor='w')
-        zoom_cb.bind('<<ComboboxSelected>>', lambda _e: self._schedule_redraw())
-
-        # Source countries (scrollable)
+        # Source countries (scrollable checkboxes)
         cf = ttk.LabelFrame(ctrl, text="Source Countries", padding=4)
         cf.pack(fill='both', expand=True, pady=2)
+
+        # Focus mode toggle
+        focus_cb = ttk.Checkbutton(
+            cf, text="Focus: only flows between selected",
+            variable=self.focus_var, command=self._on_focus_change)
+        focus_cb.pack(anchor='w', pady=(0, 4))
 
         btn_row = ttk.Frame(cf)
         btn_row.pack(fill='x', pady=(0, 3))
         ttk.Button(btn_row, text="Select All", command=self._select_all).pack(
             side='left', padx=(0, 3))
-        ttk.Button(btn_row, text="Clear All", command=self._clear_all).pack(side='left')
+        ttk.Button(btn_row, text="Clear All",  command=self._clear_all).pack(side='left')
 
         sc = tk.Canvas(cf, borderwidth=0, highlightthickness=0)
         vsb = ttk.Scrollbar(cf, orient='vertical', command=sc.yview)
@@ -207,8 +224,7 @@ class FlowMapApp:
         self._country_inner.bind(
             '<Configure>',
             lambda e: sc.configure(scrollregion=sc.bbox('all')))
-        sc.bind('<Configure>',
-                lambda e: sc.itemconfig(iid, width=e.width))
+        sc.bind('<Configure>', lambda e: sc.itemconfig(iid, width=e.width))
         sc.bind_all('<MouseWheel>',
                     lambda e: sc.yview_scroll(int(-1 * e.delta / 120), 'units'))
 
@@ -223,10 +239,11 @@ class FlowMapApp:
         # Action buttons
         af = ttk.Frame(ctrl)
         af.pack(fill='x', pady=(4, 0))
-        ttk.Button(af, text="Refresh",  command=self._do_redraw).pack(fill='x', pady=1)
-        ttk.Button(af, text="Save PNG", command=lambda: self._save('png')).pack(
+        ttk.Button(af, text="Refresh",     command=self._do_redraw).pack(fill='x', pady=1)
+        ttk.Button(af, text="Reset View",  command=self._reset_view).pack(fill='x', pady=1)
+        ttk.Button(af, text="Save PNG",    command=lambda: self._save('png')).pack(
             fill='x', pady=1)
-        ttk.Button(af, text="Save SVG", command=lambda: self._save('svg')).pack(
+        ttk.Button(af, text="Save SVG",    command=lambda: self._save('svg')).pack(
             fill='x', pady=1)
 
         # Status bar
@@ -239,69 +256,62 @@ class FlowMapApp:
         right = ttk.Frame(paned)
         paned.add(right)
 
-        # Statistics panel (packed to bottom first so map expands above it)
+        # Statistics (packed to bottom first so map fills the rest)
         self._build_stats_panel(right)
 
-        # Map figure
+        # Map figure — single full-width axes
         canvas_frame = ttk.Frame(right)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.fig = plt.figure(figsize=(14, 8))
-        gs = self.fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.04)
-        self.ax      = self.fig.add_subplot(gs[0])
-        self.zoom_ax = self.fig.add_subplot(gs[1])
+        self.fig, self.ax = plt.subplots(1, 1, figsize=(14, 9))
         self.fig.patch.set_facecolor('white')
+        self.fig.subplots_adjust(left=0.005, right=0.995, top=0.96, bottom=0.01)
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=canvas_frame)
         toolbar = NavigationToolbar2Tk(self.canvas, canvas_frame)
         toolbar.update()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
+        # Update the overview inset after any toolbar zoom / pan
+        self.canvas.mpl_connect('button_release_event', self._on_canvas_release)
+
     def _build_stats_panel(self, parent: ttk.Frame):
-        """Build the statistics panel at the bottom of the right panel."""
         stats_outer = ttk.LabelFrame(parent, text="Statistics", padding=4)
         stats_outer.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Per-tree table
-        cols = ('source', 'flow', 'terminals', 'steiner', 'coverage', 'F_str')
+        cols   = ('source', 'flow', 'terminals', 'steiner', 'coverage', 'F_str')
+        heads  = ('Source', 'Total Flow', 'Terminals', 'Steiner', 'Coverage %', 'F_str')
+        widths = (85, 80, 70, 60, 75, 60)
         self.stats_tv = ttk.Treeview(stats_outer, columns=cols,
                                      show='headings', height=3)
-        heads = ('Source', 'Total Flow', 'Terminals', 'Steiner', 'Coverage %', 'F_str')
-        widths = (85, 80, 70, 60, 75, 60)
         for col, head, w in zip(cols, heads, widths):
             self.stats_tv.heading(col, text=head)
             self.stats_tv.column(col, width=w, anchor='e')
         self.stats_tv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Scrollbar for treeview
         tv_vsb = ttk.Scrollbar(stats_outer, orient='vertical',
                                command=self.stats_tv.yview)
         self.stats_tv.configure(yscrollcommand=tv_vsb.set)
         tv_vsb.pack(side=tk.LEFT, fill=tk.Y)
 
-        # Global stats (right side of stats panel)
         gf = ttk.Frame(stats_outer)
         gf.pack(side=tk.LEFT, fill=tk.Y, padx=(10, 4))
 
         self._stat_vars = {}
-        rows = [
-            ('inter',     'Inter crossings:'),
-            ('intra',     'Intra crossings:'),
-            ('coverage',  'Total coverage:'),
-            ('info_loss', 'Info loss:'),
-        ]
-        for key, label in rows:
+        for key, label in [('inter',     'Inter crossings:'),
+                            ('intra',     'Intra crossings:'),
+                            ('coverage',  'Total coverage:'),
+                            ('info_loss', 'Info loss:')]:
             v = tk.StringVar(value='—')
             self._stat_vars[key] = v
             row_f = ttk.Frame(gf)
             row_f.pack(anchor='w', pady=1)
             ttk.Label(row_f, text=label, width=18, anchor='w').pack(side='left')
-            self._stat_vars[f'{key}_lbl'] = ttk.Label(row_f, textvariable=v,
-                                                       width=10, anchor='e')
+            self._stat_vars[f'{key}_lbl'] = ttk.Label(
+                row_f, textvariable=v, width=10, anchor='e')
             self._stat_vars[f'{key}_lbl'].pack(side='left')
 
     def _rebuild_groups_panel(self):
-        """Rebuild the groups checkbox list (called after groups change)."""
         if self._group_inner_frame is not None:
             self._group_inner_frame.destroy()
         self._group_inner_frame = ttk.Frame(self.groups_outer)
@@ -348,7 +358,7 @@ class FlowMapApp:
     def _on_year_change(self, _event=None):
         self._load_data()
 
-    # ── mode / style callbacks ──────────────────────────────────────────────
+    # ── style / mode callbacks ──────────────────────────────────────────────
 
     def _on_style_change(self):
         if self.style_var.get() == 'spiral':
@@ -365,8 +375,21 @@ class FlowMapApp:
         invalidate_spiral_cache()
         self._do_redraw()
 
+    def _on_focus_change(self):
+        """Focus mode changed — cached trees used different flow values, must rebuild."""
+        invalidate_spiral_cache()
+        self._schedule_redraw()
+
     def _on_slider_move(self, value):
         self.thresh_label.config(text=threshold_to_label(int(float(value))))
+
+    # ── canvas mouse release (toolbar zoom/pan end) ─────────────────────────
+
+    def _on_canvas_release(self, _event):
+        """Refresh the overview inset whenever the user finishes a zoom/pan."""
+        if not self._in_redraw:
+            self._draw_overview_inset()
+            self.canvas.draw_idle()
 
     # ── groups dialog ────────────────────────────────────────────────────────
 
@@ -382,7 +405,6 @@ class FlowMapApp:
         ttk.Entry(dlg, textvariable=name_var, width=24).pack(padx=8)
 
         ttk.Label(dlg, text="Member countries:", padding=(8, 6, 8, 2)).pack(anchor='w')
-
         frame = ttk.Frame(dlg, padding=(8, 0, 8, 0))
         frame.pack(fill='both')
         cvars = {}
@@ -393,7 +415,7 @@ class FlowMapApp:
                 row=i // 3, column=i % 3, sticky='w', padx=3)
 
         def _ok():
-            name = name_var.get().strip()
+            name    = name_var.get().strip()
             members = [c for c, v in cvars.items() if v.get()]
             if not name:
                 messagebox.showwarning("Missing name", "Enter a group name.", parent=dlg)
@@ -411,10 +433,9 @@ class FlowMapApp:
         ttk.Button(btn_row, text="Add Group", command=_ok).pack(side='left', padx=4)
         ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side='left')
 
-    # ── effective data (with groups applied) ───────────────────────────────
+    # ── effective data (groups applied) ────────────────────────────────────
 
     def _get_effective_data(self):
-        """Return (exp_mx, net_mx, centroids) after applying active groups."""
         active = {gn: info['members'] for gn, info in self._groups.items()
                   if info['var'].get()}
         if not active:
@@ -439,63 +460,139 @@ class FlowMapApp:
             return
 
         exp_mx, net_mx, centroids = self._get_effective_data()
-        sources     = [c for c, v in self.country_vars.items() if v.get()
-                       if c in centroids]
+        sources = [c for c, v in self.country_vars.items() if v.get()
+                   if c in centroids]
+
+        # Focus mode: restrict each source's destinations to only other
+        # selected sources.  E.g. Germany + France → only Germany↔France flows.
+        if self.focus_var.get() and len(sources) >= 2:
+            sources_set = set(sources)
+            exp_mx = exp_mx.copy()
+            net_mx = net_mx.copy()
+            for col in exp_mx.columns:
+                if col not in sources_set:
+                    exp_mx[col] = 0.0
+                    net_mx[col] = 0.0
         net_mode    = (self.data_mode_var.get() == 'net')
         spiral_mode = (self.style_var.get() == 'spiral')
         threshold   = slider_to_threshold(self.threshold_var.get())
         alpha_deg   = float(self.alpha_var.get())
         year        = self.year_var.get()
 
-        title = (f"EU Trade Flows from {', '.join(sources[:3])}{'…' if len(sources)>3 else ''} ({year})"
-                 if sources else f"EU Trade Flows ({year})  —  select sources on the left")
+        # ── preserve user zoom across redraws ─────────────────────────────
+        old_xlim = self.ax.get_xlim()
+        old_ylim = self.ax.get_ylim()
+        zoomed   = _has_custom_zoom(old_xlim, old_ylim)
 
-        trees = render_to_axes(
-            self.ax, self.eu_gdf, centroids, exp_mx, sources,
-            threshold_meur=threshold,
-            net_mode=net_mode,
-            net_matrix=net_mx,
-            title=title,
-            spiral_mode=spiral_mode,
-            alpha_deg=alpha_deg,
-            world_gdf=self.world_gdf,
-            xlim=(-25, 45), ylim=(34, 72),
+        # Remove stale overview before ax.clear() inside render_to_axes
+        if self._overview_ax is not None:
+            try:
+                self._overview_ax.remove()
+            except Exception:
+                pass
+            self._overview_ax = None
+
+        title = (
+            f"EU Trade Flows from "
+            f"{', '.join(sources[:3])}{'…' if len(sources) > 3 else ''} ({year})"
+            if sources else
+            f"EU Trade Flows ({year})  —  select source countries on the left"
         )
 
-        # ── zoom panel ──────────────────────────────────────────────────
-        zpreset = ZOOM_PRESETS.get(self.zoom_region_var.get(), (-25, 45, 34, 72))
-        zxlim = (zpreset[0], zpreset[1])
-        zylim = (zpreset[2], zpreset[3])
-        render_to_axes(
-            self.zoom_ax, self.eu_gdf, centroids, exp_mx, sources,
-            threshold_meur=threshold,
-            net_mode=net_mode,
-            net_matrix=net_mx,
-            title='',
-            spiral_mode=spiral_mode,
-            alpha_deg=alpha_deg,
-            world_gdf=self.world_gdf,
-            xlim=zxlim, ylim=zylim,
-        )
-        self.zoom_ax.set_title(self.zoom_region_var.get(), fontsize=8, pad=3)
+        self._in_redraw = True
+        try:
+            trees = render_to_axes(
+                self.ax, self.eu_gdf, centroids, exp_mx, sources,
+                threshold_meur=threshold,
+                net_mode=net_mode,
+                net_matrix=net_mx,
+                title=title,
+                spiral_mode=spiral_mode,
+                alpha_deg=alpha_deg,
+                world_gdf=self.world_gdf,
+                xlim=_FULL_XLIM, ylim=_FULL_YLIM,
+            )
 
-        self.canvas.draw_idle()
+            # Restore zoom (render_to_axes resets to full EU)
+            if zoomed:
+                self.ax.set_xlim(old_xlim)
+                self.ax.set_ylim(old_ylim)
+
+            self._draw_overview_inset()
+            self.canvas.draw_idle()
+        finally:
+            self._in_redraw = False
+
         self._current_trees = trees
-
-        # ── statistics ──────────────────────────────────────────────────
         self._update_stats(trees, net_mx, threshold)
 
-        # Status bar
-        mode_str = f"{'net' if net_mode else 'gross'} / {'spiral' if spiral_mode else 'straight'}"
+        mode_str  = f"{'net' if net_mode else 'gross'} / {'spiral' if spiral_mode else 'straight'}"
+        focus_str = "  [focus]" if (self.focus_var.get() and len(sources) >= 2) else ""
+        zoom_str  = "  [zoomed — use toolbar Home ⌂ to reset]" if zoomed else ""
         self.status_var.set(
             f"{len(sources)} source(s)  |  {mode_str}  |  "
-            f"threshold {threshold_to_label(self.threshold_var.get())}"
+            f"threshold {threshold_to_label(self.threshold_var.get())}{focus_str}{zoom_str}"
         )
+
+    # ── overview inset ──────────────────────────────────────────────────────
+
+    def _draw_overview_inset(self):
+        """Mini overview map (bottom-left) with red rectangle = current view."""
+        if self._overview_ax is not None:
+            try:
+                self._overview_ax.remove()
+            except Exception:
+                pass
+            self._overview_ax = None
+
+        if self.eu_gdf is None:
+            return
+
+        # Create inset: 17% wide × 22% tall, anchored to bottom-left of main ax
+        ov = self.ax.inset_axes([0.005, 0.015, 0.17, 0.22])
+        self._overview_ax = ov
+
+        ov.set_facecolor('#c8dff0')
+        self.eu_gdf.plot(ax=ov, color='#f0f4e8', edgecolor='#888888',
+                         linewidth=0.25, zorder=2)
+        ov.set_xlim(-25, 45)
+        ov.set_ylim(34, 72)
+        ov.set_aspect('equal')
+        ov.axis('off')
+
+        # Red rectangle showing the currently-visible portion of the main map
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        if _has_custom_zoom(xlim, ylim):
+            rx = max(xlim[0], -25);  ry = max(ylim[0], 34)
+            rw = min(xlim[1],  45) - rx
+            rh = min(ylim[1],  72) - ry
+            if rw > 0 and rh > 0:
+                ov.add_patch(mpatches.Rectangle(
+                    (rx, ry), rw, rh,
+                    edgecolor='#cc2222', facecolor='#cc2222',
+                    alpha=0.28, linewidth=1.5, zorder=3,
+                ))
+
+        ov.set_title('Overview', fontsize=5.5, pad=2, color='#666666')
+        for spine in ov.spines.values():
+            spine.set_visible(True)
+            spine.set_edgecolor('#999999')
+            spine.set_linewidth(0.6)
+
+    # ── view controls ───────────────────────────────────────────────────────
+
+    def _reset_view(self):
+        """Snap main map back to the full EU extent."""
+        self.ax.set_xlim(_FULL_XLIM)
+        self.ax.set_ylim(_FULL_YLIM)
+        self._draw_overview_inset()
+        self.canvas.draw_idle()
+        self.status_var.set(self.status_var.get().split("  [zoomed")[0])
 
     # ── statistics update ────────────────────────────────────────────────────
 
     def _update_stats(self, trees, net_matrix, threshold_meur):
-        # Clear treeview
         for row in self.stats_tv.get_children():
             self.stats_tv.delete(row)
 
@@ -505,10 +602,8 @@ class FlowMapApp:
             self._stat_vars['inter_lbl'].configure(foreground='black')
             return
 
-        # Total EU flow (sum of all positive net flows in the matrix)
         total_eu = float(net_matrix[net_matrix > threshold_meur].sum().sum())
 
-        # Per-tree rows
         for tree in trees:
             s = compute_tree_stats(tree, self._get_effective_data()[2], total_eu)
             self.stats_tv.insert('', 'end', values=(
@@ -520,22 +615,15 @@ class FlowMapApp:
                 f"{s['F_str']:.2f}",
             ))
 
-        # Cross-tree stats
         inter, intra = count_crossings(trees)
         total_shown  = sum(t.total_flow for t in trees)
         coverage_pct = total_shown / total_eu * 100.0 if total_eu > 0 else 0.0
 
-        # Information loss: sum min(exp(i→j), exp(j→i)) / total bilateral
-        # Use raw net_matrix: loss occurs where flows partially cancel
         try:
-            exp = self.export_matrix
-            bilateral = float((exp + exp.T).values.sum()) / 2.0
-            cancelled = float(exp.values.clip(0).min(exp.T.values.clip(0)).sum()) / 2.0 \
-                if hasattr(exp.values, 'sum') else 0.0
-            # Simpler: loss = sum_{i<j} min(exp_ij, exp_ji)
             import numpy as np
-            exp_np = exp.values
-            loss = float(np.minimum(exp_np, exp_np.T).sum()) / 2.0
+            exp_np    = self.export_matrix.values
+            bilateral = float((exp_np + exp_np.T).sum()) / 2.0
+            loss      = float(np.minimum(exp_np, exp_np.T).sum()) / 2.0
             info_loss_pct = loss / bilateral * 100.0 if bilateral > 0 else 0.0
         except Exception:
             info_loss_pct = 0.0
@@ -545,7 +633,6 @@ class FlowMapApp:
         self._stat_vars['coverage'].set(f"{coverage_pct:.1f}%")
         self._stat_vars['info_loss'].set(f"{info_loss_pct:.1f}%")
 
-        # Colour-code crossing count label
         lbl = self._stat_vars['inter_lbl']
         if inter == 0:
             lbl.configure(foreground='#228822')
@@ -554,7 +641,7 @@ class FlowMapApp:
         else:
             lbl.configure(foreground='#cc2222')
 
-    # ── select/clear ─────────────────────────────────────────────────────────
+    # ── select / clear ───────────────────────────────────────────────────────
 
     def _select_all(self):
         for v in self.country_vars.values():
@@ -570,8 +657,8 @@ class FlowMapApp:
 
     def _save(self, fmt: str):
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        sources  = [c for c, v in self.country_vars.items() if v.get()]
-        iso_part = '_'.join(SHORT_TO_ISO.get(c, c[:2]) for c in sources) or 'none'
+        sources   = [c for c, v in self.country_vars.items() if v.get()]
+        iso_part  = '_'.join(SHORT_TO_ISO.get(c, c[:2]) for c in sources) or 'none'
         data_str  = self.data_mode_var.get()
         style_str = self.style_var.get()
         thresh    = int(slider_to_threshold(self.threshold_var.get()))
@@ -592,6 +679,7 @@ def main():
     root = tk.Tk()
     FlowMapApp(root)
     root.mainloop()
+
 
 if __name__ == '__main__':
     main()

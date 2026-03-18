@@ -218,24 +218,73 @@ def _build_tree(
             rt = rphi(t_id)
             wavefront.insert(rt, t_id)
 
-            for nb_id in (wavefront.left_neighbor(t_id),
-                          wavefront.right_neighbor(t_id)):
+            # current_id tracks which node occupies t's wavefront slot.
+            # It starts as the leaf but may be promoted to a new Steiner node
+            # if spiral-region absorption would otherwise give children to a leaf.
+            current_id = t_id
+
+            for get_nb in (wavefront.left_neighbor, wavefront.right_neighbor):
+                nb_id = get_nb(current_id)
                 if nb_id is None or nb_id not in active:
                     continue
-                nb = nodes[nb_id]
-                if _in_spiral_region(nb.R, rphi(nb_id), t.R, rt, tan_a):
-                    # t is in nb's spiral region: t becomes parent of nb
+                nb       = nodes[nb_id]
+                curr     = nodes[current_id]
+                curr_r   = rphi(current_id)
+
+                if _in_spiral_region(nb.R, rphi(nb_id), curr.R, curr_r, tan_a):
+                    # nb must be absorbed because the spiral from nb to the
+                    # source would have to pass through curr's position.
                     wavefront.remove(nb_id)
                     active.discard(nb_id)
-                    nb.parent = t_id
-                    t.children.append(nb_id)
-                    new_l = wavefront.left_neighbor(t_id)
-                    new_r = wavefront.right_neighbor(t_id)
+
+                    if curr.is_leaf:
+                        # A leaf must not have children — placing a Steiner
+                        # node AT the leaf's position creates an invisible
+                        # zero-length edge, making the flow visually pass
+                        # *through* the leaf to reach nb.
+                        # Fix: place the Steiner node BEFORE the leaf (at
+                        # SPLIT_BACK * curr.R from source, same angular
+                        # direction).  The trunk reaches ~80 % of the way to
+                        # the leaf, then forks: one short branch continues to
+                        # the leaf, the other branch continues to nb.
+                        SPLIT_BACK = 0.80
+                        R_s        = curr.R * SPLIT_BACK
+                        # Place Steiner at angular midpoint between curr and nb
+                        # so both branches diverge symmetrically (balanced Y).
+                        dphi_nb    = _wrap(rphi(nb_id) - curr_r)
+                        phi_s_rot  = curr_r + dphi_nb * 0.5
+                        phi_s_orig = _wrap(phi_s_rot + phi_offset)
+                        xs, ys     = _cart(R_s, phi_s_orig)
+
+                        s_id = next_id[0]; next_id[0] += 1
+                        s = TreeNode(node_id=s_id, R=R_s, phi=phi_s_orig,
+                                     x=xs, y=ys, is_steiner=True)
+                        nodes[s_id]       = s
+                        rotated_phi[s_id] = phi_s_rot
+                        active.add(s_id)
+
+                        curr.parent = s_id
+                        s.children.append(current_id)
+                        nb.parent = s_id
+                        s.children.append(nb_id)
+
+                        wavefront.remove(current_id)
+                        active.discard(current_id)
+                        wavefront.insert(phi_s_rot, s_id)
+                        current_id = s_id
+                    else:
+                        # current_id is already a Steiner node (promoted in a
+                        # prior pass of this loop) — safe to add more children.
+                        nb.parent = current_id
+                        curr.children.append(nb_id)
+
+                    new_l = wavefront.left_neighbor(current_id)
+                    new_r = wavefront.right_neighbor(current_id)
                     for new_nb in (new_l, new_r):
                         if new_nb is not None and new_nb in active:
-                            try_join(t_id, new_nb)
+                            try_join(current_id, new_nb)
                 else:
-                    try_join(t_id, nb_id)
+                    try_join(current_id, nb_id)
 
         else:
             u_id, v_id, phi_j_rot = payload
@@ -385,10 +434,14 @@ def _sample_spiral(
 
 def _edge_polygon(
     pts: List[Tuple[float, float]],
-    half_w: float,
+    half_w_start: float,
+    half_w_end: float,
     color: str,
     alpha: float = 0.75,
 ) -> Optional[mpatches.PathPatch]:
+    """Tapered polygon: half_w_start at pts[0] (child/leaf end),
+    half_w_end at pts[-1] (parent/trunk end).  Linear interpolation
+    between the two widths gives smooth narrowing toward leaves."""
     if len(pts) < 2:
         return None
     arr = np.asarray(pts, dtype=float)
@@ -401,9 +454,10 @@ def _edge_polygon(
     norms[norms < 1e-15] = 1.0
     tangents /= norms
 
-    perp  = np.column_stack([-tangents[:, 1], tangents[:, 0]])
-    left  = arr + perp * half_w
-    right = arr - perp * half_w
+    perp   = np.column_stack([-tangents[:, 1], tangents[:, 0]])
+    widths = np.linspace(half_w_start, half_w_end, len(arr))
+    left   = arr + perp * widths[:, np.newaxis]
+    right  = arr - perp * widths[:, np.newaxis]
 
     poly  = np.vstack([left, right[::-1], left[[0]]])
     codes = ([Path.MOVETO]
@@ -513,50 +567,88 @@ def draw_spiral_trees(
     centroids: Dict[str, Tuple[float, float]],
     color_map: Dict[str, str],
     alpha: float = 0.75,
+    global_max_flow: Optional[float] = None,
 ) -> None:
-    """Draw all spiral trees onto ax (lon/lat coordinate space)."""
-    max_total = max((t.total_flow for t in trees), default=1.0)
+    """Draw all spiral trees onto ax (lon/lat coordinate space).
 
-    for tree in trees:
+    Parameters
+    ----------
+    global_max_flow : reference flow for cross-tree scaling (optional).
+        Pass the gross-mode maximum source total so that net-mode trees
+        appear proportionally thinner than their gross-mode counterparts.
+        Defaults to the largest total_flow among the supplied trees.
+
+    Width scaling:
+      - FLOW_GAMMA  < 1 compresses the size gap between large and small trees.
+      - Widths within each tree are strictly proportional to flow (linear)
+        so trunk > branch is always clearly visible.
+    Draw order: largest flow first so smaller trees sit on top.
+    """
+    if not trees:
+        return
+
+    if global_max_flow is None or global_max_flow <= 0:
+        global_max_flow = max(t.total_flow for t in trees)
+    if global_max_flow <= 0:
+        return
+
+    m_per_deg   = 111_000.0
+    # Cross-tree scale: power-law so smaller sources remain visible alongside
+    # large ones without being dwarfed.  Within each tree widths are strictly
+    # proportional to flow (linear) so trunk > branch is clearly visible.
+    FLOW_GAMMA  = 0.65
+    MIN_W_FRAC  = 0.004  # edges below this fraction of tree max fall back to a line
+
+    sorted_trees = sorted(trees, key=lambda t: t.total_flow, reverse=True)
+
+    for tree in sorted_trees:
         if not tree.edges:
             continue
-        color  = color_map.get(tree.source_name, '#333333')
-        nodes  = tree.tree_nodes
+        color    = color_map.get(tree.source_name, '#333333')
+        nodes    = tree.tree_nodes
         src_lon, src_lat = centroids[tree.source_name]
 
+        # max_w = widest edge child in this tree (= root-adjacent Steiner ≈ root)
         max_w = max((nodes[c].width for c, _ in tree.edges), default=0.0)
         if max_w <= 0:
             continue
 
-        m_per_deg = 111_000.0
+        # Linear width proportions within each tree; power-law across trees
+        flow_scale = (tree.total_flow / global_max_flow) ** FLOW_GAMMA
 
+        # ── edges ────────────────────────────────────────────────────────────
         for (child_id, parent_id), pts in zip(tree.edges, tree.edge_polylines):
             c_node = nodes[child_id]
+            p_node = nodes[parent_id]
             if c_node.width <= 0 or len(pts) < 2:
                 continue
+            if abs(c_node.R - p_node.R) < 1.0:
+                continue
 
-            half_w = (c_node.width / 2.0) / m_per_deg
-            frac   = c_node.width / max_w
+            # Linear: half-width strictly proportional to the flow this edge carries
+            hw   = (c_node.width / 2.0 * flow_scale) / m_per_deg
+            frac = (c_node.width / max_w) * flow_scale
 
             if frac >= MIN_W_FRAC:
-                patch = _edge_polygon(pts, half_w, color, alpha=alpha)
+                patch = _edge_polygon(pts, hw, hw, color, alpha=alpha)
                 if patch is not None:
                     ax.add_patch(patch)
             else:
+                # Flow too small for a legible polygon — draw as a thin line
                 xs, ys = zip(*pts)
-                ax.plot(xs, ys, color=color, lw=0.6, alpha=alpha * 0.7, zorder=3)
+                ax.plot(xs, ys, color=color, lw=0.7, alpha=alpha * 0.75, zorder=3)
 
-        # Source marker
-        sz = 10 + 6 * min(tree.total_flow / max(max_total, 1.0), 1.0)
+        # ── source marker ────────────────────────────────────────────────────
+        sz = 4 + 10 * flow_scale
         ax.plot(src_lon, src_lat, 's', color=color,
                 markersize=sz, markeredgecolor='white',
                 markeredgewidth=1.2, zorder=6)
 
-        # Leaf markers
+        # ── leaf markers ─────────────────────────────────────────────────────
         for nid, node in nodes.items():
             if node.is_leaf and node.country and node.country in centroids:
                 lon, lat = centroids[node.country]
-                r = max(2.5, 3 + 5 * node.width / max_w)
+                r = max(2.0, (2 + 6 * node.width / max_w) * flow_scale)
                 ax.plot(lon, lat, 'o', color=color,
                         markersize=r, markeredgecolor='white',
                         markeredgewidth=0.7, alpha=0.85, zorder=5)

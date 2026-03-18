@@ -5,6 +5,7 @@ Data modes  : 'gross' (raw exports) or 'net' (exports minus imports)
 Style modes : straight arrows or spiral trees
 """
 
+import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 from map_utils import render_basemap
@@ -73,15 +74,13 @@ def render_to_axes(
 
     # ── Spiral Tree mode ──────────────────────────────────────────────────
     if spiral_mode:
-        if net_matrix is None:
-            return []
-        cache_key = (frozenset(sources), alpha_deg, threshold_meur)
+        cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode)
         if cache_key not in _SPIRAL_CACHE:
             trees = []
             for src in sources:
-                if src not in net_matrix.index:
+                if src not in matrix.index:
                     continue
-                row = net_matrix.loc[src]
+                row = matrix.loc[src]
                 net_flows = {
                     dst: float(v) for dst, v in row.items()
                     if dst != src and float(v) > threshold_meur
@@ -101,7 +100,15 @@ def render_to_axes(
         else:
             trees = _SPIRAL_CACHE[cache_key]
 
-        draw_spiral_trees(ax, trees, centroids, color_map)
+        # Anchor display scale to gross totals so that net flows always
+        # appear proportionally thinner than the corresponding gross flows.
+        gross_max = max(
+            (float(export_matrix.loc[src].sum())
+             for src in sources if src in export_matrix.index),
+            default=None,
+        )
+        draw_spiral_trees(ax, trees, centroids, color_map,
+                          global_max_flow=gross_max)
 
         legend_elements = [
             Line2D([0], [0], color=color_map[src], linewidth=2.5, label=src)
@@ -114,14 +121,16 @@ def render_to_axes(
         return trees
 
     # ── Straight-arrow mode ────────────────────────────────────────────────
+    # Always normalise to the gross maximum so net arrows are proportionally
+    # thinner than gross ones (net ≤ gross in absolute value for any pair).
     max_val = 0.0
     for src in sources:
-        if src not in matrix.index:
+        if src not in export_matrix.index:
             continue
-        for dst in matrix.columns:
+        for dst in export_matrix.columns:
             if dst != src:
-                v = matrix.loc[src, dst]
-                if v > threshold_meur:
+                v = float(export_matrix.loc[src, dst])
+                if v > 0:
                     max_val = max(max_val, v)
 
     legend_elements = []
@@ -178,6 +187,37 @@ def render_to_axes(
                 va='bottom')
 
     return []
+
+
+def draw_flow_map(eu_gdf, centroids, export_matrix, sources,
+                  threshold_meur=0.0, net_mode=False, net_matrix=None,
+                  title="EU Trade Flow Map", output_path=None):
+    """
+    Render a multi-source flow map and save or display it (CLI entry point).
+
+    Parameters
+    ----------
+    eu_gdf         : GeoDataFrame from map_utils.load_eu_map()
+    centroids      : dict {country: (lon, lat)} from map_utils.get_centroids()
+    export_matrix  : pd.DataFrame, gross export flows in million EUR
+    sources        : list[str], source country names to highlight
+    threshold_meur : float, minimum flow value to draw (million EUR)
+    net_mode       : bool, if True use net_matrix instead of export_matrix
+    net_matrix     : pd.DataFrame, net export flows (required if net_mode=True)
+    title          : str, map title
+    output_path    : str or None, if given save PNG here; else display
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(14, 10))
+    render_to_axes(ax, eu_gdf, centroids, export_matrix, sources,
+                   threshold_meur=threshold_meur, net_mode=net_mode,
+                   net_matrix=net_matrix, title=title)
+    plt.tight_layout()
+    if output_path:
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f"Saved: {output_path}")
+        plt.close()
+    else:
+        plt.show()
 
 
 def invalidate_spiral_cache():
