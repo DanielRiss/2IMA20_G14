@@ -660,6 +660,8 @@ def compute_tree_stats(
     tree: SpiralTreeResult,
     centroids: Dict[str, Tuple[float, float]],
     total_eu_flow: float,
+    obstacles: Optional[Dict[str, Tuple[float, float]]] = None,
+    cost_weights: Dict[str, float] = {'c_s': 1.0, 'c_str': 1.0, 'c_B_ar': 1.0, 'c_obs': 1.0},
 ) -> dict:
     """
     Compute per-tree statistics.
@@ -673,75 +675,172 @@ def compute_tree_stats(
     coverage  = (tree.total_flow / total_eu_flow * 100.0
                  if total_eu_flow > 0 else 0.0)
 
-    src_lon, src_lat = centroids.get(tree.source_name, (0.0, 0.0))
 
-    # F_str: average (path_length / straight_dist) over leaves
-    edge_lookup = {e: pts for e, pts in zip(tree.edges, tree.edge_polylines)}
-    # Build parent map for traversal
-    parent_map = {n.node_id: n.parent for n in nodes.values() if n.parent is not None}
-
-    def path_to_root(leaf_id):
-        path_edges = []
-        cur = leaf_id
-        while parent_map.get(cur) is not None:
-            p = parent_map[cur]
-            path_edges.append((cur, p))
-            cur = p
-        return path_edges
-
-    def polyline_length(pts):
-        if len(pts) < 2:
-            return 0.0
-        arr = np.asarray(pts)
-        return float(np.sum(np.linalg.norm(np.diff(arr, axis=0), axis=1)))
+    # F_str: straightening cost over join nodes (paper equation)
+    def _edge_angle(from_node: TreeNode, to_node: TreeNode) -> float:
+        dx = to_node.x - from_node.x
+        dy = to_node.y - from_node.y
+        return math.atan2(dy, dx)
 
     f_str_vals = []
-    for nid, node in nodes.items():
-        if not node.is_leaf or node.country not in centroids:
+    c = 0.5
+    for node in nodes.values():
+        # join nodes are Steiner nodes with a parent and at least 2 children
+        if not node.is_steiner or node.parent is None or len(node.children) < 2:
             continue
-        leaf_lon, leaf_lat = centroids[node.country]
-        straight = math.hypot(leaf_lon - src_lon, leaf_lat - src_lat)
-        if straight < 1e-9:
+
+        beta = _edge_angle(node, nodes[node.parent])
+
+        child_info = []
+        for cid in node.children:
+            child = nodes[cid]
+            child_info.append((child.width, _edge_angle(node, child)))
+
+        if not child_info:
             continue
-        path_len = sum(
-            polyline_length(edge_lookup.get(e, []))
-            for e in path_to_root(nid)
-        )
-        f_str_vals.append(path_len / straight)
 
-    F_str = float(np.mean(f_str_vals)) if f_str_vals else 1.0
+        t_star = max(t for t, _ in child_info)
+        threshold = c * t_star
 
-    # F_sm: average absolute angle change per edge
-    angle_devs = []
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for t_i, beta_i in child_info:
+            if t_i >= threshold:
+                weighted_sum += t_i * beta_i
+                weight_total += t_i
+
+        if weight_total <= 0:
+            continue
+
+        beta_star = weighted_sum / weight_total
+        d = _wrap(beta - beta_star)
+        f_str_vals.append(d * d)
+
+    F_str = float(np.sum(f_str_vals)) if f_str_vals else 0.0
+
+    # F_s: smoothing cost as (beta1 - beta2)^2 summed over subdivision points
+    # (approximate using polyline vertex angles on sampled spiral edges)
+    f_s_vals = []
     for pts in tree.edge_polylines:
         if len(pts) < 3:
             continue
         arr = np.asarray(pts)
-        v1 = arr[1:-1] - arr[:-2]
-        v2 = arr[2:]  - arr[1:-1]
+        # compute angles at interior points in local path direction
+        prev = arr[:-2]
+        cur = arr[1:-1]
+        nxt = arr[2:]
+
+        v1 = cur - prev
+        v2 = nxt - cur
+
         n1 = np.linalg.norm(v1, axis=1)
         n2 = np.linalg.norm(v2, axis=1)
         mask = (n1 > 1e-12) & (n2 > 1e-12)
-        if mask.any():
-            cos_a = np.clip(
-                np.sum(v1[mask] * v2[mask], axis=1) / (n1[mask] * n2[mask]),
-                -1, 1
-            )
-            angle_devs.extend(np.arccos(cos_a).tolist())
 
-    F_sm = float(np.mean(angle_devs)) if angle_devs else 0.0
+        if not mask.any():
+            continue
+
+        a1 = np.arctan2(v1[mask, 1], v1[mask, 0])
+        a2 = np.arctan2(v2[mask, 1], v2[mask, 0])
+
+        diff = _wrap(a1 - a2)
+        f_s_vals.extend((diff * diff).tolist())
+
+    F_s = float(np.sum(f_s_vals)) if f_s_vals else 0.0
+
+    # F_obs: obstacle cost for join nodes
+    F_obs = 0.0
+    if obstacles:
+        B = _OPT_OVERLAP_B  # buffer in degrees
+        m_per_deg = _OPT_M_PER_DEG
+        for node in nodes.values():
+            if not node.is_steiner or node.parent is None or len(node.children) < 2:
+                continue
+            p_lon, p_lat = _to_lonlat(node.x, node.y)
+            t = (node.width / 2.0) / m_per_deg  # half width in degrees
+            for obs_name, (o_lon, o_lat) in obstacles.items():
+                D = math.hypot(p_lon - o_lon, p_lat - o_lat)  # approx distance in degrees
+                if D < t:
+                    if D > 1e-12:
+                        term1 = (t / (B * D)) * ((B / 2) + t)
+                        term2 = (D / (B * t)) * ((B / 2) - t)
+                        F_obs += term1 + term2
+                elif D <= t + B:
+                    F_obs += (1.0 - (D - t) / B) ** 2
+
+    F_ar, F_B = compute_tree_ar_and_balancing_cost(tree, alpha_deg=25.0)
+
+    c_s = cost_weights.get('c_s', 1.0)
+    c_str = cost_weights.get('c_str', 1.0)
+    c_B_ar = cost_weights.get('c_B_ar', 1.0)
+    c_obs = cost_weights.get('c_obs', 1.0)
 
     # Paper cost: c_obs=2.0, c_sm=0.4, c_ar=0.077, c_str=0.4
-    F_cost = 0.4 * F_sm + 0.4 * F_str
+    F_cost = c_s * F_s + c_str * F_str + c_B_ar * (F_B + F_ar) + c_obs * F_obs
 
     return {
-        'n_terminals': n_leaves,
-        'n_steiner':   n_steiner,
+        'n_terminals':  n_leaves,
+        'n_steiner':    n_steiner,
         'coverage_pct': coverage,
-        'F_str':       F_str,
-        'F_sm':        F_sm,
-        'F_cost':      F_cost,
+        'F_str':        F_str,
+        'F_s':          F_s,
+        'F_obs':        F_obs,
+        'F_ar':         F_ar,
+        'F_B':          F_B,
+        'F_cost':       F_cost,
     }
+
+def compute_tree_ar_and_balancing_cost(
+    tree: SpiralTreeResult,
+    alpha_deg: float = 25.0,
+) -> Tuple[float, float, float]:
+    """Compute both angle-restriction (F_AR) and balancing (F_B) costs."""
+    nodes = tree.tree_nodes
+    alpha = math.radians(alpha_deg)
+
+    def _edge_angle(from_node: TreeNode, to_node: TreeNode) -> float:
+        dx = to_node.x - from_node.x
+        dy = to_node.y - from_node.y
+        return math.atan2(dy, dx)
+
+    f_ar = 0.0
+    f_b = 0.0
+    eps = 1e-12
+
+    for node in nodes.values():
+        if not node.is_steiner or len(node.children) != 2 or node.parent is None:
+            continue
+
+        parent_node = nodes[node.parent]
+        c0 = nodes[node.children[0]]
+        c1 = nodes[node.children[1]]
+
+        parent_angle = _edge_angle(node, parent_node)
+        b0 = _wrap(_edge_angle(node, c0) - parent_angle)
+        b1 = _wrap(_edge_angle(node, c1) - parent_angle)
+
+        def _clamp_half_pi(val: float) -> float:
+            if val > math.pi / 2:
+                return math.pi - val
+            if val < -math.pi / 2:
+                return -math.pi - val
+            return val
+
+        b0 = _clamp_half_pi(b0)
+        b1 = _clamp_half_pi(b1)
+
+        beta1, beta2 = (b0, b1) if b0 >= b1 else (b1, b0)
+
+        cos_b1 = max(abs(math.cos(beta1)), eps)
+        cos_b2 = max(abs(math.cos(beta2)), eps)
+        f_ar += math.log(1.0 / cos_b1) + math.log(1.0 / cos_b2)
+
+        delta = max(abs(beta1 - beta2), eps)
+        half_delta = max(0.5 * delta, eps)
+        sin_half = max(math.sin(half_delta), eps)
+        f_b += 2.0 * (math.tan(alpha) ** 2) * math.log(1.0 / sin_half)
+
+    return float(f_ar), float(f_b)
 
 
 def count_crossings(trees: List[SpiralTreeResult]):
