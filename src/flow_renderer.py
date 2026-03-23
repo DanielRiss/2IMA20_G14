@@ -37,6 +37,8 @@ def render_to_axes(
     xlim=(-25, 45),
     ylim=(34, 72),
     highlighted_countries=None,
+    precomputed_trees=None,
+    width_scale=1.0,
 ) -> list:
     """
     Draw a multi-source flow map onto an existing matplotlib Axes.
@@ -74,41 +76,38 @@ def render_to_axes(
 
     # ── Spiral Tree mode ──────────────────────────────────────────────────
     if spiral_mode:
-        cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode)
-        if cache_key not in _SPIRAL_CACHE:
-            trees = []
-            for src in sources:
-                if src not in matrix.index:
-                    continue
-                row = matrix.loc[src]
-                net_flows = {
-                    dst: float(v) for dst, v in row.items()
-                    if dst != src and float(v) > threshold_meur
-                }
-                if not net_flows:
-                    continue
-                result = compute_spiral_tree(
-                    source_name=src,
-                    terminal_names=list(net_flows.keys()),
-                    net_flows=net_flows,
-                    centroids=centroids,
-                    obstacle_names=[s for s in sources if s != src],
-                    alpha_deg=alpha_deg,
-                )
-                trees.append(result)
-            _SPIRAL_CACHE[cache_key] = trees
+        if precomputed_trees is not None:
+            # Use caller-supplied trees (e.g. after inter-tree optimisation)
+            trees = precomputed_trees
         else:
-            trees = _SPIRAL_CACHE[cache_key]
+            cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode)
+            if cache_key not in _SPIRAL_CACHE:
+                trees = []
+                for src in sources:
+                    if src not in matrix.index:
+                        continue
+                    row = matrix.loc[src]
+                    net_flows = {
+                        dst: float(v) for dst, v in row.items()
+                        if dst != src and float(v) > threshold_meur
+                    }
+                    if not net_flows:
+                        continue
+                    result = compute_spiral_tree(
+                        source_name=src,
+                        terminal_names=list(net_flows.keys()),
+                        net_flows=net_flows,
+                        centroids=centroids,
+                        obstacle_names=[s for s in sources if s != src],
+                        alpha_deg=alpha_deg,
+                    )
+                    trees.append(result)
+                _SPIRAL_CACHE[cache_key] = trees
+            else:
+                trees = _SPIRAL_CACHE[cache_key]
 
-        # Anchor display scale to gross totals so that net flows always
-        # appear proportionally thinner than the corresponding gross flows.
-        gross_max = max(
-            (float(export_matrix.loc[src].sum())
-             for src in sources if src in export_matrix.index),
-            default=None,
-        )
         draw_spiral_trees(ax, trees, centroids, color_map,
-                          global_max_flow=gross_max)
+                          width_scale=width_scale)
 
         legend_elements = [
             Line2D([0], [0], color=color_map[src], linewidth=2.5, label=src)

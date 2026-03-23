@@ -20,11 +20,14 @@ All centroid keys use the same short-name format as map_utils (e.g. 'Germany').
 
 from __future__ import annotations
 
+import copy as _copy
 import math
 import heapq
 import bisect
+import random as _random
+import threading as _threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib
@@ -567,37 +570,31 @@ def draw_spiral_trees(
     centroids: Dict[str, Tuple[float, float]],
     color_map: Dict[str, str],
     alpha: float = 0.75,
-    global_max_flow: Optional[float] = None,
+    width_scale: float = 1.0,
 ) -> None:
     """Draw all spiral trees onto ax (lon/lat coordinate space).
 
-    Parameters
-    ----------
-    global_max_flow : reference flow for cross-tree scaling (optional).
-        Pass the gross-mode maximum source total so that net-mode trees
-        appear proportionally thinner than their gross-mode counterparts.
-        Defaults to the largest total_flow among the supplied trees.
+    Width model
+    -----------
+    Every edge's half-width is proportional to the flow it carries divided by
+    the *total flow of the entire visualisation* (sum of all trees shown).
+    This means adding more sources makes each tree proportionally narrower,
+    and switching to net mode automatically produces thinner edges because net
+    totals are smaller.  ``width_scale`` is a linear multiplier the user can
+    adjust in the UI to make all edges thicker or thinner regardless of the
+    data magnitude.
 
-    Width scaling:
-      - FLOW_GAMMA  < 1 compresses the size gap between large and small trees.
-      - Widths within each tree are strictly proportional to flow (linear)
-        so trunk > branch is always clearly visible.
-    Draw order: largest flow first so smaller trees sit on top.
+    Draw order: largest-flow tree first so smaller trees sit on top.
     """
     if not trees:
         return
 
-    if global_max_flow is None or global_max_flow <= 0:
-        global_max_flow = max(t.total_flow for t in trees)
-    if global_max_flow <= 0:
+    total_viz_flow = sum(t.total_flow for t in trees)
+    if total_viz_flow <= 0:
         return
 
-    m_per_deg   = 111_000.0
-    # Cross-tree scale: power-law so smaller sources remain visible alongside
-    # large ones without being dwarfed.  Within each tree widths are strictly
-    # proportional to flow (linear) so trunk > branch is clearly visible.
-    FLOW_GAMMA  = 0.65
-    MIN_W_FRAC  = 0.004  # edges below this fraction of tree max fall back to a line
+    m_per_deg  = 111_000.0
+    MIN_HW_DEG = 0.003 * MAX_DISPLAY_W_M / m_per_deg  # ~1.3 km — below this use a line
 
     sorted_trees = sorted(trees, key=lambda t: t.total_flow, reverse=True)
 
@@ -613,8 +610,8 @@ def draw_spiral_trees(
         if max_w <= 0:
             continue
 
-        # Linear width proportions within each tree; power-law across trees
-        flow_scale = (tree.total_flow / global_max_flow) ** FLOW_GAMMA
+        # Fraction of total visualisation flow carried by this tree
+        flow_scale = tree.total_flow / total_viz_flow
 
         # ── edges ────────────────────────────────────────────────────────────
         for (child_id, parent_id), pts in zip(tree.edges, tree.edge_polylines):
@@ -625,21 +622,19 @@ def draw_spiral_trees(
             if abs(c_node.R - p_node.R) < 1.0:
                 continue
 
-            # Linear: half-width strictly proportional to the flow this edge carries
-            hw   = (c_node.width / 2.0 * flow_scale) / m_per_deg
-            frac = (c_node.width / max_w) * flow_scale
+            # half-width in degrees: (this edge's flow / total viz flow) * scale
+            hw = (c_node.width / 2.0 * flow_scale) / m_per_deg * width_scale
 
-            if frac >= MIN_W_FRAC:
+            if hw >= MIN_HW_DEG:
                 patch = _edge_polygon(pts, hw, hw, color, alpha=alpha)
                 if patch is not None:
                     ax.add_patch(patch)
             else:
-                # Flow too small for a legible polygon — draw as a thin line
                 xs, ys = zip(*pts)
                 ax.plot(xs, ys, color=color, lw=0.7, alpha=alpha * 0.75, zorder=3)
 
         # ── source marker ────────────────────────────────────────────────────
-        sz = 4 + 10 * flow_scale
+        sz = max(3.0, 4 + 10 * flow_scale * width_scale)
         ax.plot(src_lon, src_lat, 's', color=color,
                 markersize=sz, markeredgecolor='white',
                 markeredgewidth=1.2, zorder=6)
@@ -648,7 +643,7 @@ def draw_spiral_trees(
         for nid, node in nodes.items():
             if node.is_leaf and node.country and node.country in centroids:
                 lon, lat = centroids[node.country]
-                r = max(2.0, (2 + 6 * node.width / max_w) * flow_scale)
+                r = max(2.0, (2 + 6 * node.width / max_w) * flow_scale * width_scale)
                 ax.plot(lon, lat, 'o', color=color,
                         markersize=r, markeredgecolor='white',
                         markeredgewidth=0.7, alpha=0.85, zorder=5)
@@ -781,6 +776,296 @@ def count_crossings(trees: List[SpiralTreeResult]):
                 pass
 
     return inter_cross, intra_cross
+
+
+# ── multi-tree inter-tree optimizer ───────────────────────────────────────────
+#
+# Implements the inter-tree cost functions from the task spec, then uses
+# simulated annealing to reduce crossings/overlaps by perturbing Steiner node
+# positions while keeping leaf nodes and source positions fixed.
+
+DEFAULT_OPT_WEIGHTS: dict = {
+    'c_cross':   2.0,
+    'c_overlap': 2.0,
+}
+
+_OPT_M_PER_DEG = 111_000.0
+_OPT_OVERLAP_B   = 1.5    # buffer size in degrees (~165 km) for F_obs formula
+
+
+# ── vectorised segment-crossing helpers ──────────────────────────────────────
+
+def _seg_cross_batch(
+    pts_a: np.ndarray,   # (Na, 2)
+    pts_b: np.ndarray,   # (Nb, 2)
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (row_indices, col_indices) of crossing segment pairs between two polylines.
+
+    Uses 2-D cross-product formulation, fully vectorised over all (Na-1)×(Nb-1)
+    segment pairs.  Returns empty arrays when no crossings exist.
+    """
+    if len(pts_a) < 2 or len(pts_b) < 2:
+        return np.empty(0, int), np.empty(0, int)
+
+    p1 = pts_a[:-1]          # (Na-1, 2) segment starts
+    p2 = pts_a[1:]            # (Na-1, 2) segment ends
+    p3 = pts_b[:-1]           # (Nb-1, 2)
+    p4 = pts_b[1:]
+
+    d1 = (p2 - p1)[:, None, :]      # (Na-1, 1, 2)
+    d2 = (p4 - p3)[None, :, :]      # (1, Nb-1, 2)
+    dp = p3[None, :, :] - p1[:, None, :]   # (Na-1, Nb-1, 2)
+
+    cross = d1[..., 0] * d2[..., 1] - d1[..., 1] * d2[..., 0]  # (Na-1, Nb-1)
+    t_num = dp[..., 0] * d2[..., 1] - dp[..., 1] * d2[..., 0]
+    u_num = dp[..., 0] * d1[..., 1] - dp[..., 1] * d1[..., 0]
+
+    eps   = 1e-14
+    valid = np.abs(cross) > eps
+    safe  = np.where(valid, cross, 1.0)
+    t     = np.where(valid, t_num / safe, -1.0)
+    u     = np.where(valid, u_num / safe, -1.0)
+
+    margin = 1e-9
+    mask = valid & (t > margin) & (t < 1 - margin) & (u > margin) & (u < 1 - margin)
+    return np.where(mask)
+
+
+def _crossing_cost(trees: List[SpiralTreeResult]) -> float:
+    """F_cross = Σ csc(max(γ, ε)) for all inter-tree edge crossings."""
+    eps   = 1e-6
+    # Build per-tree list of edge arrays
+    edge_arrays: List[Tuple[int, np.ndarray]] = []
+    for ti, tree in enumerate(trees):
+        for pts in tree.edge_polylines:
+            if len(pts) >= 2:
+                edge_arrays.append((ti, np.asarray(pts, dtype=float)))
+
+    cost = 0.0
+    n = len(edge_arrays)
+    for a in range(n):
+        ti, arr_a = edge_arrays[a]
+        for b in range(a + 1, n):
+            tj, arr_b = edge_arrays[b]
+            if ti == tj:
+                continue
+            rows, cols = _seg_cross_batch(arr_a, arr_b)
+            for i, j in zip(rows, cols):
+                da = arr_a[i + 1] - arr_a[i]
+                db = arr_b[j + 1] - arr_b[j]
+                na, nb = np.linalg.norm(da), np.linalg.norm(db)
+                if na < eps or nb < eps:
+                    cost += 1.0 / eps
+                    continue
+                cos_g = abs(float(np.dot(da / na, db / nb)))
+                sin_g = math.sqrt(max(0.0, 1.0 - min(cos_g, 1.0) ** 2))
+                cost += 1.0 / max(sin_g, eps)
+    return cost
+
+
+def _overlap_cost(
+    trees: List[SpiralTreeResult],
+    total_viz_flow: float,
+    B: float = _OPT_OVERLAP_B,
+    n_samples: int = 6,
+) -> float:
+    """F_overlap = Σ F_obs(p, Ω_{T_j}) for sample points on each tree's edges.
+
+    Uses numpy vectorised distance — no shapely required.
+    B             : buffer size in degrees
+    n_samples     : sample points per edge
+    total_viz_flow: sum of all tree flows (matches draw_spiral_trees width model)
+    """
+    if total_viz_flow <= 0:
+        return 0.0
+
+    # Pre-stack all edge points for each tree: (M_j, 2)
+    tree_stacks: List[Optional[np.ndarray]] = []
+    for tree in trees:
+        arrs = [np.asarray(pts, dtype=float) for pts in tree.edge_polylines if len(pts) >= 2]
+        tree_stacks.append(np.vstack(arrs) if arrs else None)
+
+    cost = 0.0
+    for ti, tree in enumerate(trees):
+        nodes    = tree.tree_nodes
+        max_w    = max((nodes[c].width for c, _ in tree.edges), default=0.0)
+        if max_w <= 0 or tree.total_flow <= 0:
+            continue
+        fs = tree.total_flow / total_viz_flow   # linear, matches draw_spiral_trees
+
+        for (child_id, _), pts in zip(tree.edges, tree.edge_polylines):
+            if len(pts) < 2:
+                continue
+            c_node = nodes[child_id]
+            if c_node.width <= 0:
+                continue
+            t = (c_node.width / 2.0 * fs) / _OPT_M_PER_DEG   # half-width °
+
+            arr = np.asarray(pts, dtype=float)
+            idx = np.round(np.linspace(0, len(arr) - 1, n_samples)).astype(int)
+            samples = arr[idx]   # (n_samples, 2)
+
+            for tj, stack_j in enumerate(tree_stacks):
+                if ti == tj or stack_j is None or len(stack_j) == 0:
+                    continue
+                # Vectorised min-distance: (n_samples, M_j) → (n_samples,)
+                dists = np.linalg.norm(
+                    samples[:, None, :] - stack_j[None, :, :], axis=2
+                )
+                D = np.min(dists, axis=1)   # (n_samples,)
+
+                # F_obs formula applied element-wise
+                mask_deep = D < t
+                mask_buff = (~mask_deep) & (D < t + B)
+
+                if np.any(mask_deep):
+                    d_s = np.maximum(D[mask_deep], 1e-9)
+                    t_s = max(t, 1e-9)
+                    c1  = (t / (B * d_s)) * (B / 2 + t)
+                    c2  = (D[mask_deep] / (B * t_s)) * (B / 2 - t)
+                    cost += float(np.sum(c1 + c2))
+
+                if np.any(mask_buff):
+                    cost += float(np.sum((1.0 - (D[mask_buff] - t) / B) ** 2))
+
+    return cost
+
+
+def compute_inter_tree_cost(
+    trees: List[SpiralTreeResult],
+    weights: Optional[dict] = None,
+) -> Tuple[float, float, float]:
+    """Compute inter-tree costs.
+
+    Returns (f_cross, f_overlap, weighted_total).
+    Uses DEFAULT_OPT_WEIGHTS unless overridden.
+    """
+    w              = {**DEFAULT_OPT_WEIGHTS, **(weights or {})}
+    total_viz_flow = sum(t.total_flow for t in trees) or 1.0
+    fc    = _crossing_cost(trees)
+    fo    = _overlap_cost(trees, total_viz_flow)
+    total = w['c_cross'] * fc + w['c_overlap'] * fo
+    return fc, fo, total
+
+
+# ── simulated annealing optimizer ────────────────────────────────────────────
+
+def optimize_multi_tree(
+    trees: List[SpiralTreeResult],
+    centroids: Dict[str, Tuple[float, float]],
+    stop_event: _threading.Event,
+    on_update: Callable[[int, float, List['SpiralTreeResult']], None],
+    weights: Optional[dict] = None,
+    max_iter: int = 300,
+    T_init: float = 5.0,
+    T_min: float  = 1e-3,
+    update_every: int = 10,
+) -> None:
+    """Simulated annealing to reduce inter-tree crossings and overlaps.
+
+    Runs in a background thread.  Calls
+        on_update(iteration, cost, trees_snapshot)
+    every `update_every` accepted steps, and once more on completion with
+    iteration=-1.  Does NOT modify the input trees; works on deep copies.
+
+    Degrees of freedom: Steiner node (x, y) positions.  Leaf nodes and
+    source positions are held fixed.
+    """
+    w     = {**DEFAULT_OPT_WEIGHTS, **(weights or {})}
+    state = _copy.deepcopy(trees)
+
+    # Source EPSG:3035 absolute positions
+    src_xy: Dict[int, Tuple[float, float]] = {}
+    for ti, tree in enumerate(state):
+        lon, lat    = centroids[tree.source_name]
+        src_xy[ti]  = _to3035(lon, lat)
+
+    # Pool of (tree_idx, node_id) for all Steiner nodes
+    steiner_pool: List[Tuple[int, int]] = [
+        (ti, nid)
+        for ti, tree in enumerate(state)
+        for nid, node in tree.tree_nodes.items()
+        if node.is_steiner
+    ]
+
+    if not steiner_pool:
+        on_update(-1, 0.0, state)
+        return
+
+    total_viz_flow = sum(t.total_flow for t in state) or 1.0
+
+    def _full_cost() -> float:
+        fc = _crossing_cost(state)
+        fo = _overlap_cost(state, total_viz_flow)
+        return w['c_cross'] * fc + w['c_overlap'] * fo
+
+    current_cost = _full_cost()
+    alpha = (T_min / T_init) ** (1.0 / max(max_iter, 1))
+    T     = T_init
+
+    for it in range(max_iter):
+        if stop_event.is_set():
+            break
+
+        ti, nid = _random.choice(steiner_pool)
+        tree     = state[ti]
+        node     = tree.tree_nodes[nid]
+        sx, sy   = src_xy[ti]
+
+        # Adaptive step: 10% of current R or at least 20 km in projection units
+        step  = max(node.R * 0.10, 20_000.0)
+        new_x = node.x + _random.gauss(0.0, step)
+        new_y = node.y + _random.gauss(0.0, step)
+        new_R, new_phi = _polar(new_x, new_y)
+
+        if new_R < 10_000.0:      # too close to source — reject
+            T *= alpha
+            continue
+
+        # Enforce R hierarchy: Steiner.R < min(children.R), > parent.R
+        valid = all(tree.tree_nodes[c].R > new_R for c in node.children)
+        if valid and node.parent is not None:
+            par = tree.tree_nodes[node.parent]
+            if par.R > 0 and par.R >= new_R:
+                valid = False
+        if not valid:
+            T *= alpha
+            continue
+
+        # Save state of affected edges (those incident to this node)
+        orig_pos   = (node.x, node.y, node.R, node.phi)
+        orig_edges = {
+            i: tree.edge_polylines[i]
+            for i, (c, p) in enumerate(tree.edges)
+            if c == nid or p == nid
+        }
+
+        # Apply perturbation
+        node.x, node.y, node.R, node.phi = new_x, new_y, new_R, new_phi
+        for i in orig_edges:
+            c, p   = tree.edges[i]
+            cn, pn = tree.tree_nodes[c], tree.tree_nodes[p]
+            new_pts = _sample_spiral(cn.R, cn.phi, pn.R, pn.phi, sx, sy)
+            tree.edge_polylines[i] = new_pts if new_pts else orig_edges[i]
+
+        new_cost = _full_cost()
+        delta    = new_cost - current_cost
+
+        # Metropolis acceptance criterion
+        if delta < 0 or _random.random() < math.exp(-delta / max(T, 1e-12)):
+            current_cost = new_cost
+        else:
+            # Revert
+            node.x, node.y, node.R, node.phi = orig_pos
+            for i, pts in orig_edges.items():
+                tree.edge_polylines[i] = pts
+
+        T *= alpha
+
+        if (it + 1) % update_every == 0:
+            on_update(it + 1, current_cost, _copy.deepcopy(state))
+
+    on_update(-1, current_cost, state)
 
 
 # ── __main__ standalone test ─────────────────────────────────────────────────

@@ -12,6 +12,7 @@ to the full EU extent.
 
 import os
 import sys
+import threading
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -27,7 +28,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data_loader import load_trade_data, ISO_SHORT
 from map_utils import load_eu_map, load_world_map, get_centroids
 from flow_renderer import render_to_axes, invalidate_spiral_cache
-from spiral_tree import compute_tree_stats, count_crossings
+from spiral_tree import (compute_tree_stats, count_crossings,
+                         optimize_multi_tree, compute_inter_tree_cost,
+                         DEFAULT_OPT_WEIGHTS)
 from group_utils import DEFAULT_GROUPS, apply_groups
 
 # ── paths ──────────────────────────────────────────────────────────────────────
@@ -108,13 +111,16 @@ class FlowMapApp:
         self._in_redraw    = False   # guard against recursive callbacks
 
         # ── control variables ──────────────────────────────────────────────
-        self.data_mode_var = tk.StringVar(value='gross')
-        self.style_var     = tk.StringVar(value='straight')
-        self.alpha_var     = tk.IntVar(value=25)
-        self.threshold_var = tk.IntVar(value=0)
-        self.year_var      = tk.StringVar(value=str(AVAILABLE_YEARS[0]))
-        self.country_vars  = {c: tk.BooleanVar(value=False) for c in EU27_COUNTRIES}
-        self.focus_var     = tk.BooleanVar(value=False)
+        self.data_mode_var  = tk.StringVar(value='gross')
+        self.style_var      = tk.StringVar(value='straight')
+        self.alpha_var      = tk.IntVar(value=25)
+        # Width scale slider: integer position 10–500, maps to 0.10×–5.00×
+        # (position 100 = 1.00× = default)
+        self.width_scale_var = tk.IntVar(value=100)
+        self.threshold_var  = tk.IntVar(value=0)
+        self.year_var       = tk.StringVar(value=str(AVAILABLE_YEARS[0]))
+        self.country_vars   = {c: tk.BooleanVar(value=False) for c in EU27_COUNTRIES}
+        self.focus_var      = tk.BooleanVar(value=False)
 
         # ── groups ─────────────────────────────────────────────────────────
         self._groups: dict = {}
@@ -128,6 +134,12 @@ class FlowMapApp:
         # ── stats state ────────────────────────────────────────────────────
         self._current_trees = []
         self._redraw_after_id = None
+
+        # ── multi-tree optimizer state ──────────────────────────────────────
+        self._opt_thread:     threading.Thread | None = None
+        self._opt_stop:       threading.Event         = threading.Event()
+        self._opt_orig_trees: list | None             = None  # snapshot before opt
+        self._opt_trees:      list | None             = None  # latest opt result
 
         self._build_ui()
         self._load_data()
@@ -180,6 +192,16 @@ class FlowMapApp:
                              command=self._on_alpha_move)
         alpha_sl.pack(fill='x')
         alpha_sl.bind('<ButtonRelease-1>', lambda _e: self._on_alpha_release())
+
+        # Width scale slider (only visible in spiral mode, packed alongside alpha)
+        self.width_frame = ttk.LabelFrame(ctrl, text="Edge Width Scale", padding=4)
+        self.width_label = ttk.Label(self.width_frame, text="1.00×")
+        self.width_label.pack(anchor='w')
+        width_sl = ttk.Scale(self.width_frame, from_=10, to=500,
+                             variable=self.width_scale_var, orient='horizontal',
+                             command=self._on_width_move)
+        width_sl.pack(fill='x')
+        width_sl.bind('<ButtonRelease-1>', lambda _e: self._do_redraw())
 
         # Threshold
         self.thresh_frame = tf = ttk.LabelFrame(ctrl, text="Min Flow Threshold", padding=4)
@@ -235,6 +257,9 @@ class FlowMapApp:
                                  command=self._schedule_redraw)
             cb.pack(anchor='w', pady=1)
             self._country_checkbuttons[country] = cb
+
+        # Multi-tree optimizer panel
+        self._build_opt_panel(ctrl)
 
         # Action buttons
         af = ttk.Frame(ctrl)
@@ -331,6 +356,196 @@ class FlowMapApp:
         ttk.Button(self._group_inner_frame, text="New Group…",
                    command=self._new_group_dialog).pack(anchor='w', pady=(3, 0))
 
+    # ── multi-tree optimizer UI ──────────────────────────────────────────────
+
+    def _build_opt_panel(self, parent: ttk.Frame):
+        of = ttk.LabelFrame(parent, text="Multi-Tree Optimization", padding=4)
+        of.pack(fill='x', pady=2)
+
+        # Weight sliders (compact, two columns)
+        wf = ttk.Frame(of)
+        wf.pack(fill='x', pady=(0, 3))
+        self._opt_weight_vars: dict = {}
+        for col, (key, label) in enumerate([('c_cross', 'Cross w:'),
+                                             ('c_overlap', 'Overlap w:')]):
+            v = tk.DoubleVar(value=DEFAULT_OPT_WEIGHTS[key])
+            self._opt_weight_vars[key] = v
+            ttk.Label(wf, text=label, width=9).grid(row=0, column=col*2, sticky='w')
+            ttk.Entry(wf, textvariable=v, width=5).grid(row=0, column=col*2+1,
+                                                         padx=(0, 6))
+
+        # Iterations entry
+        iter_f = ttk.Frame(of)
+        iter_f.pack(fill='x', pady=(0, 3))
+        ttk.Label(iter_f, text="Max iter:").pack(side='left')
+        self._opt_maxiter_var = tk.IntVar(value=300)
+        ttk.Entry(iter_f, textvariable=self._opt_maxiter_var, width=6).pack(
+            side='left', padx=(2, 0))
+
+        # Buttons row
+        br = ttk.Frame(of)
+        br.pack(fill='x')
+        self._opt_start_btn = ttk.Button(br, text="Optimize Layout",
+                                         command=self._start_opt)
+        self._opt_start_btn.pack(side='left', padx=(0, 3))
+        self._opt_stop_btn  = ttk.Button(br, text="Stop",
+                                         command=self._stop_opt, state='disabled')
+        self._opt_stop_btn.pack(side='left', padx=(0, 3))
+        self._opt_reset_btn = ttk.Button(br, text="Reset",
+                                         command=self._reset_opt, state='disabled')
+        self._opt_reset_btn.pack(side='left')
+
+        # Status label
+        self._opt_status_var = tk.StringVar(value="")
+        ttk.Label(of, textvariable=self._opt_status_var,
+                  foreground='#555555', font=('TkDefaultFont', 8),
+                  wraplength=240).pack(anchor='w', pady=(2, 0))
+
+    # ── optimizer callbacks ──────────────────────────────────────────────────
+
+    def _start_opt(self):
+        if not self._current_trees:
+            messagebox.showinfo("No trees",
+                                "Render in Spiral Trees mode first, then optimize.")
+            return
+        if self.style_var.get() != 'spiral':
+            messagebox.showinfo("Spiral only",
+                                "Multi-tree optimization applies to Spiral Trees mode only.")
+            return
+
+        # Snapshot the trees before optimizing so Reset can restore them
+        import copy
+        self._opt_orig_trees = copy.deepcopy(self._current_trees)
+        self._opt_trees      = None
+
+        self._opt_start_btn.config(state='disabled')
+        self._opt_stop_btn.config(state='normal')
+        self._opt_reset_btn.config(state='disabled')
+        self._opt_status_var.set("Starting…")
+
+        self._opt_stop.clear()
+        self._opt_thread = threading.Thread(
+            target=self._run_opt_thread, daemon=True)
+        self._opt_thread.start()
+
+    def _run_opt_thread(self):
+        """Background thread: runs SA optimizer and posts updates to main thread."""
+        _, _, centroids = self._get_effective_data()
+        weights = {k: v.get() for k, v in self._opt_weight_vars.items()}
+        max_iter = max(1, self._opt_maxiter_var.get())
+
+        def _on_update(it, cost, trees):
+            # Schedule UI update on the main thread (thread-safe Tkinter API)
+            try:
+                self.root.after(
+                    0,
+                    lambda it=it, cost=cost, trees=trees:
+                        self._apply_opt_update(it, cost, trees)
+                )
+            except Exception:
+                pass   # root may have been destroyed
+
+        optimize_multi_tree(
+            trees=list(self._current_trees),
+            centroids=centroids,
+            stop_event=self._opt_stop,
+            on_update=_on_update,
+            weights=weights,
+            max_iter=max_iter,
+            update_every=max(1, max_iter // 30),   # ~30 visual updates
+        )
+
+    def _apply_opt_update(self, it: int, cost: float, trees: list):
+        """Called on main thread; updates display and button states."""
+        self._opt_trees     = trees
+        self._current_trees = trees
+
+        if it == -1:   # optimization finished / stopped
+            self._opt_status_var.set(f"Done — cost: {cost:.3f}")
+            self._opt_start_btn.config(state='normal')
+            self._opt_stop_btn.config(state='disabled')
+            self._opt_reset_btn.config(state='normal')
+        else:
+            self._opt_status_var.set(f"Iter {it}  |  cost: {cost:.3f}")
+
+        self._redraw_with_trees(trees)
+
+    def _stop_opt(self):
+        self._opt_stop.set()
+        self._opt_stop_btn.config(state='disabled')
+        # _apply_opt_update with it=-1 will re-enable Start once the thread exits
+
+    def _reset_opt(self):
+        if self._opt_orig_trees is not None:
+            self._current_trees = self._opt_orig_trees
+            self._opt_trees     = None
+            self._opt_reset_btn.config(state='disabled')
+            self._opt_status_var.set("Reset to original layout.")
+            self._redraw_with_trees(self._opt_orig_trees)
+
+    def _redraw_with_trees(self, trees: list):
+        """Re-render the map using the given (possibly optimised) trees."""
+        if self.export_matrix is None:
+            return
+
+        exp_mx, net_mx, centroids = self._get_effective_data()
+        sources = [c for c, v in self.country_vars.items() if v.get()
+                   if c in centroids]
+
+        # Focus-mode column filter (same as _do_redraw)
+        if self.focus_var.get() and len(sources) >= 2:
+            sources_set = set(sources)
+            exp_mx = exp_mx.copy(); net_mx = net_mx.copy()
+            for col in exp_mx.columns:
+                if col not in sources_set:
+                    exp_mx[col] = 0.0; net_mx[col] = 0.0
+
+        net_mode    = (self.data_mode_var.get() == 'net')
+        alpha_deg   = float(self.alpha_var.get())
+        threshold   = slider_to_threshold(self.threshold_var.get())
+        year        = self.year_var.get()
+
+        old_xlim = self.ax.get_xlim()
+        old_ylim = self.ax.get_ylim()
+        zoomed   = _has_custom_zoom(old_xlim, old_ylim)
+
+        if self._overview_ax is not None:
+            try:
+                self._overview_ax.remove()
+            except Exception:
+                pass
+            self._overview_ax = None
+
+        title = (
+            f"EU Trade Flows from "
+            f"{', '.join(sources[:3])}{'…' if len(sources) > 3 else ''} ({year})"
+            if sources else
+            f"EU Trade Flows ({year})"
+        )
+
+        self._in_redraw = True
+        try:
+            render_to_axes(
+                self.ax, self.eu_gdf, centroids, exp_mx, sources,
+                threshold_meur=threshold,
+                net_mode=net_mode,
+                net_matrix=net_mx,
+                title=title,
+                spiral_mode=True,
+                alpha_deg=alpha_deg,
+                world_gdf=self.world_gdf,
+                xlim=_FULL_XLIM, ylim=_FULL_YLIM,
+                precomputed_trees=trees,
+                width_scale=self.width_scale_var.get() / 100.0,
+            )
+            if zoomed:
+                self.ax.set_xlim(old_xlim)
+                self.ax.set_ylim(old_ylim)
+            self._draw_overview_inset()
+            self.canvas.draw_idle()
+        finally:
+            self._in_redraw = False
+
     # ── data loading ────────────────────────────────────────────────────────
 
     def _load_data(self):
@@ -363,10 +578,16 @@ class FlowMapApp:
     def _on_style_change(self):
         if self.style_var.get() == 'spiral':
             self.alpha_frame.pack(fill='x', pady=2, before=self.thresh_frame)
+            self.width_frame.pack(fill='x', pady=2, before=self.thresh_frame)
         else:
             self.alpha_frame.pack_forget()
+            self.width_frame.pack_forget()
         invalidate_spiral_cache()
         self._schedule_redraw()
+
+    def _on_width_move(self, value):
+        scale = int(float(value)) / 100.0
+        self.width_label.config(text=f"{scale:.2f}×")
 
     def _on_alpha_move(self, value):
         self.alpha_label.config(text=f"{int(float(value))}°")
@@ -450,6 +671,13 @@ class FlowMapApp:
     # ── redraw ──────────────────────────────────────────────────────────────
 
     def _schedule_redraw(self):
+        # Any parameter change invalidates a running or completed optimisation
+        if self._opt_thread is not None and self._opt_thread.is_alive():
+            self._opt_stop.set()
+        self._opt_trees      = None
+        self._opt_orig_trees = None
+        if hasattr(self, '_opt_reset_btn'):
+            self._opt_reset_btn.config(state='disabled')
         if self._redraw_after_id is not None:
             self.root.after_cancel(self._redraw_after_id)
         self._redraw_after_id = self.root.after(60, self._do_redraw)
@@ -511,6 +739,7 @@ class FlowMapApp:
                 alpha_deg=alpha_deg,
                 world_gdf=self.world_gdf,
                 xlim=_FULL_XLIM, ylim=_FULL_YLIM,
+                width_scale=self.width_scale_var.get() / 100.0,
             )
 
             # Restore zoom (render_to_axes resets to full EU)
