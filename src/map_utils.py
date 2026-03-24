@@ -8,6 +8,7 @@ import urllib.request
 import zipfile
 import geopandas as gpd
 import matplotlib
+import matplotlib.axes
 
 EU27_ISO = [
     'AT', 'BE', 'BG', 'CY', 'CZ', 'DE', 'DK', 'EE', 'ES', 'FI',

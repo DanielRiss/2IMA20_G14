@@ -62,10 +62,8 @@ def _polar(dx: float, dy: float) -> Tuple[float, float]:
 def _cart(R: float, phi: float) -> Tuple[float, float]:
     return R * math.cos(phi), R * math.sin(phi)
 
-def _wrap(phi: float) -> float:
-    while phi >  math.pi: phi -= 2 * math.pi
-    while phi <= -math.pi: phi += 2 * math.pi
-    return phi
+def _wrap(phi):
+    return ((phi + math.pi) % (2 * math.pi)) - math.pi
 
 
 # ── data structures ──────────────────────────────────────────────────────────
@@ -654,29 +652,12 @@ def draw_spiral_trees(
                 bbox=dict(boxstyle='round,pad=0.12', fc='white', alpha=0.7, lw=0))
 
 
-# ── statistics helpers ────────────────────────────────────────────────────────
+# ── standalone single-tree cost functions ────────────────────────────────────
 
-def compute_tree_stats(
-    tree: SpiralTreeResult,
-    centroids: Dict[str, Tuple[float, float]],
-    total_eu_flow: float,
-    obstacles: Optional[Dict[str, Tuple[float, float]]] = None,
-    cost_weights: Dict[str, float] = {'c_s': 1.0, 'c_str': 1.0, 'c_B_ar': 1.0, 'c_obs': 1.0},
-) -> dict:
-    """
-    Compute per-tree statistics.
-
-    Returns dict with keys:
-      n_terminals, n_steiner, coverage_pct, F_str, F_sm, F_cost
-    """
+def compute_f_str(tree: SpiralTreeResult) -> float:
+    """Straightening cost: sum of (β − β_star)² over all join nodes."""
     nodes = tree.tree_nodes
-    n_leaves  = sum(1 for n in nodes.values() if n.is_leaf)
-    n_steiner = sum(1 for n in nodes.values() if n.is_steiner)
-    coverage  = (tree.total_flow / total_eu_flow * 100.0
-                 if total_eu_flow > 0 else 0.0)
 
-
-    # F_str: straightening cost over join nodes (paper equation)
     def _edge_angle(from_node: TreeNode, to_node: TreeNode) -> float:
         dx = to_node.x - from_node.x
         dy = to_node.y - from_node.y
@@ -716,10 +697,11 @@ def compute_tree_stats(
         d = _wrap(beta - beta_star)
         f_str_vals.append(d * d)
 
-    F_str = float(np.sum(f_str_vals)) if f_str_vals else 0.0
+    return float(np.sum(f_str_vals)) if f_str_vals else 0.0
 
-    # F_s: smoothing cost as (beta1 - beta2)^2 summed over subdivision points
-    # (approximate using polyline vertex angles on sampled spiral edges)
+
+def compute_f_s(tree: SpiralTreeResult) -> float:
+    """Smoothing cost: sum of (β1 − β2)² over interior polyline points of each edge."""
     f_s_vals = []
     for pts in tree.edge_polylines:
         if len(pts) < 3:
@@ -727,8 +709,8 @@ def compute_tree_stats(
         arr = np.asarray(pts)
         # compute angles at interior points in local path direction
         prev = arr[:-2]
-        cur = arr[1:-1]
-        nxt = arr[2:]
+        cur  = arr[1:-1]
+        nxt  = arr[2:]
 
         v1 = cur - prev
         v2 = nxt - cur
@@ -746,17 +728,29 @@ def compute_tree_stats(
         diff = _wrap(a1 - a2)
         f_s_vals.extend((diff * diff).tolist())
 
-    F_s = float(np.sum(f_s_vals)) if f_s_vals else 0.0
+    return float(np.sum(f_s_vals)) if f_s_vals else 0.0
 
-    # F_obs: obstacle cost for join nodes
+
+def compute_f_obs(
+    tree: SpiralTreeResult,
+    obstacles: Optional[Dict[str, Tuple[float, float]]],
+    src_xy: Tuple[float, float] = (0.0, 0.0),
+) -> float:
+    """Obstacle cost: sum of F_obs(p, Ω) over join nodes p and obstacle centroids Ω.
+
+    src_xy: absolute EPSG:3035 position of the source node (metres).
+    node.x / node.y are local offsets from the source, so the absolute
+    node position is (node.x + src_xy[0], node.y + src_xy[1]).
+    """
+    nodes = tree.tree_nodes
     F_obs = 0.0
     if obstacles:
-        B = _OPT_OVERLAP_B  # buffer in degrees
+        B         = _OPT_OVERLAP_B  # buffer in degrees
         m_per_deg = _OPT_M_PER_DEG
         for node in nodes.values():
             if not node.is_steiner or node.parent is None or len(node.children) < 2:
                 continue
-            p_lon, p_lat = _to_lonlat(node.x, node.y)
+            p_lon, p_lat = _to_lonlat(node.x + src_xy[0], node.y + src_xy[1])
             t = (node.width / 2.0) / m_per_deg  # half width in degrees
             for obs_name, (o_lon, o_lat) in obstacles.items():
                 D = math.hypot(p_lon - o_lon, p_lat - o_lat)  # approx distance in degrees
@@ -767,16 +761,39 @@ def compute_tree_stats(
                         F_obs += term1 + term2
                 elif D <= t + B:
                     F_obs += (1.0 - (D - t) / B) ** 2
+    return F_obs
 
-    F_ar, F_B = compute_tree_ar_and_balancing_cost(tree, alpha_deg=25.0)
 
-    c_s = cost_weights.get('c_s', 1.0)
-    c_str = cost_weights.get('c_str', 1.0)
-    c_B_ar = cost_weights.get('c_B_ar', 1.0)
-    c_obs = cost_weights.get('c_obs', 1.0)
+# ── statistics helpers ────────────────────────────────────────────────────────
 
-    # Paper cost: c_obs=2.0, c_sm=0.4, c_ar=0.077, c_str=0.4
-    F_cost = c_s * F_s + c_str * F_str + c_B_ar * (F_B + F_ar) + c_obs * F_obs
+def compute_tree_stats(
+    tree: SpiralTreeResult,
+    centroids: Dict[str, Tuple[float, float]],
+    total_eu_flow: float,
+    obstacles: Optional[Dict[str, Tuple[float, float]]] = None,
+    alpha_deg: float = 25.0,
+) -> dict:
+    """
+    Compute per-tree statistics.
+
+    Returns dict with keys:
+      n_terminals, n_steiner, coverage_pct, F_str, F_s, F_obs, F_ar, F_B, F_cost
+    """
+    nodes     = tree.tree_nodes
+    n_leaves  = sum(1 for n in nodes.values() if n.is_leaf)
+    n_steiner = sum(1 for n in nodes.values() if n.is_steiner)
+    coverage  = (tree.total_flow / total_eu_flow * 100.0
+                 if total_eu_flow > 0 else 0.0)
+
+    F_str     = compute_f_str(tree)
+    F_s       = compute_f_s(tree)
+    sx, sy    = _to3035(*centroids[tree.source_name])
+    F_obs     = compute_f_obs(tree, obstacles, (sx, sy))
+    F_ar, F_B = compute_f_ar_and_b(tree, alpha_deg)
+
+    w      = DEFAULT_F_TOTAL_WEIGHTS
+    F_cost = (w['c_obs'] * F_obs + w['c_S'] * F_s
+              + w['c_AR'] * (F_ar + F_B) + w['c_str'] * F_str)
 
     return {
         'n_terminals':  n_leaves,
@@ -790,7 +807,7 @@ def compute_tree_stats(
         'F_cost':       F_cost,
     }
 
-def compute_tree_ar_and_balancing_cost(
+def compute_f_ar_and_b(
     tree: SpiralTreeResult,
     alpha_deg: float = 25.0,
 ) -> Tuple[float, float, float]:
@@ -888,6 +905,15 @@ DEFAULT_OPT_WEIGHTS: dict = {
     'c_overlap': 2.0,
 }
 
+DEFAULT_F_TOTAL_WEIGHTS: dict = {
+    'c_obs':     2.0,
+    'c_S':       0.4,
+    'c_AR':      0.077,
+    'c_str':     0.4,
+    'c_cross':   2.0,
+    'c_overlap': 2.0,
+}
+
 _OPT_M_PER_DEG = 111_000.0
 _OPT_OVERLAP_B   = 1.5    # buffer size in degrees (~165 km) for F_obs formula
 
@@ -930,7 +956,7 @@ def _seg_cross_batch(
     return np.where(mask)
 
 
-def _crossing_cost(trees: List[SpiralTreeResult]) -> float:
+def compute_f_cross(trees: List[SpiralTreeResult]) -> float:
     """F_cross = Σ csc(max(γ, ε)) for all inter-tree edge crossings."""
     eps   = 1e-6
     # Build per-tree list of edge arrays
@@ -962,7 +988,35 @@ def _crossing_cost(trees: List[SpiralTreeResult]) -> float:
     return cost
 
 
-def _overlap_cost(
+def _pts_to_segs_min_dist(
+    pts: np.ndarray,
+    seg_a: np.ndarray,
+    seg_b: np.ndarray,
+) -> np.ndarray:
+    """Minimum distance from each point in pts to any segment (seg_a[s], seg_b[s]).
+
+    pts   : (N, 2)
+    seg_a : (S, 2) — segment start points
+    seg_b : (S, 2) — segment end points
+    Returns (N,) array of minimum distances, fully vectorised.
+    Degenerate zero-length segments are handled by projecting to seg_a.
+    """
+    ab  = seg_b - seg_a                                      # (S, 2)
+    ab2 = np.einsum('si,si->s', ab, ab)                     # (S,) squared lengths
+    ap  = pts[:, None, :] - seg_a[None, :, :]               # (N, S, 2)
+    # Scalar projection parameter t = dot(ap, ab) / |ab|^2, clamped to [0, 1]
+    t   = np.einsum('nsi,si->ns', ap, ab)                   # (N, S)
+    safe = np.where(ab2 > 0, ab2, 1.0)                      # avoid /0
+    t   = np.clip(t / safe, 0.0, 1.0)
+    t   = np.where(ab2[None, :] > 0, t, 0.0)               # degenerate -> project to a
+    # Closest point on each segment: (N, S, 2)
+    closest = seg_a[None, :, :] + t[:, :, None] * ab[None, :, :]
+    diff    = pts[:, None, :] - closest                     # (N, S, 2)
+    dists   = np.sqrt(np.einsum('nsi,nsi->ns', diff, diff)) # (N, S)
+    return np.min(dists, axis=1)                             # (N,)
+
+
+def compute_f_overlap(
     trees: List[SpiralTreeResult],
     total_viz_flow: float,
     B: float = _OPT_OVERLAP_B,
@@ -978,19 +1032,25 @@ def _overlap_cost(
     if total_viz_flow <= 0:
         return 0.0
 
-    # Pre-stack all edge points for each tree: (M_j, 2)
-    tree_stacks: List[Optional[np.ndarray]] = []
+    # Pre-stack all segments for each tree as (seg_a, seg_b) pairs
+    tree_segs: List[Optional[tuple]] = []
     for tree in trees:
-        arrs = [np.asarray(pts, dtype=float) for pts in tree.edge_polylines if len(pts) >= 2]
-        tree_stacks.append(np.vstack(arrs) if arrs else None)
+        a_list, b_list = [], []
+        for pts in tree.edge_polylines:
+            if len(pts) < 2:
+                continue
+            arr = np.asarray(pts, dtype=float)
+            a_list.append(arr[:-1])
+            b_list.append(arr[1:])
+        tree_segs.append(
+            (np.vstack(a_list), np.vstack(b_list)) if a_list else None
+        )
 
     cost = 0.0
     for ti, tree in enumerate(trees):
-        nodes    = tree.tree_nodes
-        max_w    = max((nodes[c].width for c, _ in tree.edges), default=0.0)
-        if max_w <= 0 or tree.total_flow <= 0:
+        nodes = tree.tree_nodes
+        if tree.total_flow <= 0:
             continue
-        fs = tree.total_flow / total_viz_flow   # linear, matches draw_spiral_trees
 
         for (child_id, _), pts in zip(tree.edges, tree.edge_polylines):
             if len(pts) < 2:
@@ -998,20 +1058,17 @@ def _overlap_cost(
             c_node = nodes[child_id]
             if c_node.width <= 0:
                 continue
-            t = (c_node.width / 2.0 * fs) / _OPT_M_PER_DEG   # half-width °
+            t = (c_node.width / 2.0) / _OPT_M_PER_DEG   # half-width °
 
             arr = np.asarray(pts, dtype=float)
             idx = np.round(np.linspace(0, len(arr) - 1, n_samples)).astype(int)
             samples = arr[idx]   # (n_samples, 2)
 
-            for tj, stack_j in enumerate(tree_stacks):
-                if ti == tj or stack_j is None or len(stack_j) == 0:
+            for tj, segs_j in enumerate(tree_segs):
+                if ti == tj or segs_j is None:
                     continue
-                # Vectorised min-distance: (n_samples, M_j) → (n_samples,)
-                dists = np.linalg.norm(
-                    samples[:, None, :] - stack_j[None, :, :], axis=2
-                )
-                D = np.min(dists, axis=1)   # (n_samples,)
+                seg_a_j, seg_b_j = segs_j
+                D = _pts_to_segs_min_dist(samples, seg_a_j, seg_b_j)  # (n_samples,)
 
                 # F_obs formula applied element-wise
                 mask_deep = D < t
@@ -1033,18 +1090,110 @@ def _overlap_cost(
 def compute_inter_tree_cost(
     trees: List[SpiralTreeResult],
     weights: Optional[dict] = None,
-) -> Tuple[float, float, float]:
-    """Compute inter-tree costs.
+    centroids: Optional[Dict[str, Tuple[float, float]]] = None,
+    alpha_deg: float = 25.0,
+    B_obs: float = _OPT_OVERLAP_B,
+    n_overlap_samples: int = 6,
+) -> dict:
+    """Compute all F_total cost terms for a set of trees.
 
-    Returns (f_cross, f_overlap, weighted_total).
-    Uses DEFAULT_OPT_WEIGHTS unless overridden.
+    Returns a dict with keys:
+        f_obs, f_s, f_ar, f_b, f_str, f_cross, f_overlap, f_total.
+    If centroids is None, single-tree terms are 0.0 and f_total covers
+    only the inter-tree components.
+    Uses DEFAULT_F_TOTAL_WEIGHTS unless overridden by weights.
     """
-    w              = {**DEFAULT_OPT_WEIGHTS, **(weights or {})}
+    w     = {**DEFAULT_F_TOTAL_WEIGHTS, **(weights or {})}
+    cents = centroids or {}
+
+    # ── single-tree terms ─────────────────────────────────────────────────
+    obstacle_map: Dict[str, Tuple[float, float]] = {}
+    for tree in trees:
+        if tree.source_name in cents:
+            obstacle_map[tree.source_name] = cents[tree.source_name]
+        for node in tree.tree_nodes.values():
+            if node.is_leaf and node.country and node.country in cents:
+                obstacle_map[node.country] = cents[node.country]
+
+    f_obs = 0.0
+    for t in trees:
+        sx, sy = _to3035(*cents[t.source_name]) if t.source_name in cents else (0.0, 0.0)
+        f_obs += compute_f_obs(t, obstacle_map, (sx, sy))
+    f_s   = sum(compute_f_s(t) for t in trees)
+    f_ar  = 0.0
+    f_b   = 0.0
+    for t in trees:
+        ar, b = compute_f_ar_and_b(t, alpha_deg)
+        f_ar += ar
+        f_b  += b
+    f_str = sum(compute_f_str(t) for t in trees)
+
+    # ── inter-tree terms ──────────────────────────────────────────────────
     total_viz_flow = sum(t.total_flow for t in trees) or 1.0
-    fc    = _crossing_cost(trees)
-    fo    = _overlap_cost(trees, total_viz_flow)
-    total = w['c_cross'] * fc + w['c_overlap'] * fo
-    return fc, fo, total
+    f_cross   = compute_f_cross(trees)
+    f_overlap = compute_f_overlap(
+        trees, total_viz_flow, B=B_obs, n_samples=n_overlap_samples
+    )
+
+    # ── f_total via compute_f_total ───────────────────────────────────────
+    if cents:
+        f_total = compute_f_total(trees, cents, alpha_deg, w, B_obs, n_overlap_samples)
+    else:
+        f_total = w['c_cross'] * f_cross + w['c_overlap'] * f_overlap
+
+    return {
+        'f_obs':     f_obs,
+        'f_s':       f_s,
+        'f_ar':      f_ar,
+        'f_b':       f_b,
+        'f_str':     f_str,
+        'f_cross':   f_cross,
+        'f_overlap': f_overlap,
+        'f_total':   f_total,
+    }
+
+
+# === F_total: TOTAL COST FUNCTION ===
+# Calls all 7 cost terms. All must remain active.
+# F_total = c_obs*F_obs + c_S*F_S + c_AR*(F_AR+F_B) + c_str*F_str + c_cross*F_cross + c_overlap*F_overlap
+# Removing or zeroing any term is incorrect.
+
+def compute_f_total(
+    trees: List[SpiralTreeResult],
+    centroids: Dict[str, Tuple[float, float]],
+    alpha_deg: float,
+    weights: Dict[str, float],
+    B_obs: float,
+    n_overlap_samples: int,
+) -> float:
+    """Compute the unified total cost F_total over all trees."""
+    w = {**DEFAULT_F_TOTAL_WEIGHTS, **weights}
+
+    # Build obstacle_map: source centroids + leaf centroids across all trees
+    obstacle_map: Dict[str, Tuple[float, float]] = {}
+    for tree in trees:
+        if tree.source_name in centroids:
+            obstacle_map[tree.source_name] = centroids[tree.source_name]
+        for node in tree.tree_nodes.values():
+            if node.is_leaf and node.country and node.country in centroids:
+                obstacle_map[node.country] = centroids[node.country]
+
+    total = 0.0
+    for tree in trees:
+        sx, sy = _to3035(*centroids[tree.source_name])
+        total += w['c_obs']  * compute_f_obs(tree, obstacle_map, (sx, sy))
+        total += w['c_S']    * compute_f_s(tree)
+        f_ar, f_b = compute_f_ar_and_b(tree, alpha_deg)
+        total += w['c_AR']   * (f_ar + f_b)
+        total += w['c_str']  * compute_f_str(tree)
+
+    total_viz_flow = sum(t.total_flow for t in trees) or 1.0
+    total += w['c_cross']   * compute_f_cross(trees)
+    total += w['c_overlap'] * compute_f_overlap(
+        trees, total_viz_flow, B=B_obs, n_samples=n_overlap_samples
+    )
+
+    return total
 
 
 # ── simulated annealing optimizer ────────────────────────────────────────────
@@ -1059,6 +1208,9 @@ def optimize_multi_tree(
     T_init: float = 5.0,
     T_min: float  = 1e-3,
     update_every: int = 10,
+    alpha_deg: float = 25.0,
+    B_obs: float = _OPT_OVERLAP_B,
+    n_overlap_samples: int = 6,
 ) -> None:
     """Simulated annealing to reduce inter-tree crossings and overlaps.
 
@@ -1070,7 +1222,7 @@ def optimize_multi_tree(
     Degrees of freedom: Steiner node (x, y) positions.  Leaf nodes and
     source positions are held fixed.
     """
-    w     = {**DEFAULT_OPT_WEIGHTS, **(weights or {})}
+    w     = {**DEFAULT_F_TOTAL_WEIGHTS, **(weights or {})}
     state = _copy.deepcopy(trees)
 
     # Source EPSG:3035 absolute positions
@@ -1094,9 +1246,7 @@ def optimize_multi_tree(
     total_viz_flow = sum(t.total_flow for t in state) or 1.0
 
     def _full_cost() -> float:
-        fc = _crossing_cost(state)
-        fo = _overlap_cost(state, total_viz_flow)
-        return w['c_cross'] * fc + w['c_overlap'] * fo
+        return compute_f_total(state, centroids, alpha_deg, w, B_obs, n_overlap_samples)
 
     current_cost = _full_cost()
     alpha = (T_min / T_init) ** (1.0 / max(max_iter, 1))
