@@ -39,6 +39,7 @@ def render_to_axes(
     highlighted_countries=None,
     precomputed_trees=None,
     width_scale=1.0,
+    exponent=0.5,
 ) -> list:
     """
     Draw a multi-source flow map onto an existing matplotlib Axes.
@@ -80,7 +81,7 @@ def render_to_axes(
             # Use caller-supplied trees (e.g. after inter-tree optimisation)
             trees = precomputed_trees
         else:
-            cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode)
+            cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode, exponent)
             if cache_key not in _SPIRAL_CACHE:
                 trees = []
                 for src in sources:
@@ -100,6 +101,7 @@ def render_to_axes(
                         centroids=centroids,
                         obstacle_names=[s for s in sources if s != src],
                         alpha_deg=alpha_deg,
+                        exponent=exponent,
                     )
                     trees.append(result)
                 _SPIRAL_CACHE[cache_key] = trees
@@ -107,7 +109,7 @@ def render_to_axes(
                 trees = _SPIRAL_CACHE[cache_key]
 
         draw_spiral_trees(ax, trees, centroids, color_map,
-                          width_scale=width_scale)
+                          width_scale=width_scale, exponent=exponent)
 
         legend_elements = [
             Line2D([0], [0], color=color_map[src], linewidth=2.5, label=src)

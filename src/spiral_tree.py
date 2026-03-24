@@ -45,7 +45,8 @@ MAX_DISPLAY_W_M    = EU_EXTENT_M * 0.012   # ≈48 000 m
 OBSTACLE_RADIUS_M  = 150_000.0
 LEAF_OBSTACLE_M    =  30_000.0
 N_SPIRAL_SAMPLES   = 40
-MIN_W_FRAC         = 0.005
+MIN_W_FRAC         = 0.05
+MIN_HW_DISPLAY_DEG = 0.005        # ~555 m — absolute display floor in degrees
 
 
 # ── coordinate helpers ───────────────────────────────────────────────────────
@@ -349,20 +350,21 @@ def _postorder(nodes: Dict[int, TreeNode], root_id: int) -> List[int]:
     return list(reversed(order))
 
 
-def _assign_widths(nodes: Dict[int, TreeNode], root_id: int) -> None:
+def _assign_widths(nodes: Dict[int, TreeNode], root_id: int, exponent: float = 0.5) -> None:
     """
     Three-phase bottom-up width assignment with monotonicity assertion.
 
-    Phase 1 — pure post-order: leaf.width = leaf.weight (raw flow);
-               internal.width = sum(children.width)
+    Phase 1 — pure post-order: leaf.width = weight ** exponent
+               (exponent=1.0 → linear, 0.5 → sqrt, 0.25 → aggressive compression)
     Phase 2 — assert conservation invariant at every internal node
     Phase 3 — scale all widths to display units: root maps to MAX_DISPLAY_W_M
+    Phase 4 — enforce minimum width floor (MIN_W_FRAC ratio)
     """
     # Phase 1: raw weights
     for nid in _postorder(nodes, root_id):
         n = nodes[nid]
         if n.is_leaf:
-            n.width = n.weight
+            n.width = n.weight ** exponent
         else:
             n.width = sum(nodes[c].width for c in n.children)
 
@@ -386,6 +388,12 @@ def _assign_widths(nodes: Dict[int, TreeNode], root_id: int) -> None:
     scale = MAX_DISPLAY_W_M / root_w
     for n in nodes.values():
         n.width *= scale
+
+    # Phase 4: enforce minimum width floor (200:1 max ratio)
+    min_w = MIN_W_FRAC * nodes[root_id].width
+    for n in nodes.values():
+        if n.width < min_w:
+            n.width = min_w
 
 
 # ── spiral edge sampling ──────────────────────────────────────────────────────
@@ -479,6 +487,7 @@ def compute_spiral_tree(
     centroids: Dict[str, Tuple[float, float]],
     obstacle_names: List[str],
     alpha_deg: float = 25.0,
+    exponent: float = 0.5,
 ) -> SpiralTreeResult:
     """Compute a spiral tree for one source country."""
     tan_a = math.tan(math.radians(alpha_deg))
@@ -537,7 +546,7 @@ def compute_spiral_tree(
         tan_a=tan_a, obstacles=obstacles, phi_offset=phi_offset,
     )
 
-    _assign_widths(tree_nodes, root_id=0)
+    _assign_widths(tree_nodes, root_id=0, exponent=exponent)
 
     edges = [(nid, n.parent)
              for nid, n in tree_nodes.items() if n.parent is not None]
@@ -569,6 +578,7 @@ def draw_spiral_trees(
     color_map: Dict[str, str],
     alpha: float = 0.75,
     width_scale: float = 1.0,
+    exponent: float = 0.5,
 ) -> None:
     """Draw all spiral trees onto ax (lon/lat coordinate space).
 
@@ -592,7 +602,6 @@ def draw_spiral_trees(
         return
 
     m_per_deg  = 111_000.0
-    MIN_HW_DEG = 0.003 * MAX_DISPLAY_W_M / m_per_deg  # ~1.3 km — below this use a line
 
     sorted_trees = sorted(trees, key=lambda t: t.total_flow, reverse=True)
 
@@ -609,7 +618,7 @@ def draw_spiral_trees(
             continue
 
         # Fraction of total visualisation flow carried by this tree
-        flow_scale = tree.total_flow / total_viz_flow
+        flow_scale = (tree.total_flow / total_viz_flow) ** exponent
 
         # ── edges ────────────────────────────────────────────────────────────
         for (child_id, parent_id), pts in zip(tree.edges, tree.edge_polylines):
@@ -622,14 +631,11 @@ def draw_spiral_trees(
 
             # half-width in degrees: (this edge's flow / total viz flow) * scale
             hw = (c_node.width / 2.0 * flow_scale) / m_per_deg * width_scale
+            hw = max(hw, MIN_HW_DISPLAY_DEG)   # absolute display floor
 
-            if hw >= MIN_HW_DEG:
-                patch = _edge_polygon(pts, hw, hw, color, alpha=alpha)
-                if patch is not None:
-                    ax.add_patch(patch)
-            else:
-                xs, ys = zip(*pts)
-                ax.plot(xs, ys, color=color, lw=0.7, alpha=alpha * 0.75, zorder=3)
+            patch = _edge_polygon(pts, hw, hw, color, alpha=alpha)
+            if patch is not None:
+                ax.add_patch(patch)
 
         # ── source marker ────────────────────────────────────────────────────
         sz = max(3.0, 4 + 10 * flow_scale * width_scale)
@@ -655,7 +661,15 @@ def draw_spiral_trees(
 # ── standalone single-tree cost functions ────────────────────────────────────
 
 def compute_f_str(tree: SpiralTreeResult) -> float:
-    """Straightening cost: sum of (β − β_star)² over all join nodes."""
+    """Straightening cost: sum of (β − β_star)² over all join nodes.
+
+    The bearing-angle approximation is intentionally used instead of true
+    spiral pitch angle β.  For all valid log-spiral join nodes, β = alpha_deg
+    by construction, which makes the spec-correct F_str values constant across
+    all valid tree states and provides no optimization signal.  The
+    bearing-angle approximation varies with node geometry after perturbation
+    and provides genuine gradient information during optimization.
+    """
     nodes = tree.tree_nodes
 
     def _edge_angle(from_node: TreeNode, to_node: TreeNode) -> float:
@@ -731,6 +745,31 @@ def compute_f_s(tree: SpiralTreeResult) -> float:
     return float(np.sum(f_s_vals)) if f_s_vals else 0.0
 
 
+def _f_obs_kernel(D, t: float, B: float):
+    """F_obs potential formula applied to distance(s) D.
+
+    D : scalar float or numpy array (same units as t and B).
+    Returns the same type/shape as D.
+    """
+    arr    = np.atleast_1d(np.asarray(D, dtype=float))
+    result = np.zeros_like(arr)
+    t_s    = max(t, 1e-9)
+
+    mask_deep = arr < t
+    mask_buff = (~mask_deep) & (arr < t + B)
+
+    if mask_deep.any():
+        d_s               = np.maximum(arr[mask_deep], 1e-9)
+        c1                = (t / (B * d_s)) * (B / 2 + t)
+        c2                = (arr[mask_deep] / (B * t_s)) * (B / 2 - t)
+        result[mask_deep] = c1 + c2
+
+    if mask_buff.any():
+        result[mask_buff] = (1.0 - (arr[mask_buff] - t) / B) ** 2
+
+    return float(result[0]) if np.ndim(D) == 0 else result
+
+
 def compute_f_obs(
     tree: SpiralTreeResult,
     obstacles: Optional[Dict[str, Tuple[float, float]]],
@@ -754,13 +793,7 @@ def compute_f_obs(
             t = (node.width / 2.0) / m_per_deg  # half width in degrees
             for obs_name, (o_lon, o_lat) in obstacles.items():
                 D = math.hypot(p_lon - o_lon, p_lat - o_lat)  # approx distance in degrees
-                if D < t:
-                    if D > 1e-12:
-                        term1 = (t / (B * D)) * ((B / 2) + t)
-                        term2 = (D / (B * t)) * ((B / 2) - t)
-                        F_obs += term1 + term2
-                elif D <= t + B:
-                    F_obs += (1.0 - (D - t) / B) ** 2
+                F_obs += _f_obs_kernel(D, t, B)
     return F_obs
 
 
@@ -811,7 +844,15 @@ def compute_f_ar_and_b(
     tree: SpiralTreeResult,
     alpha_deg: float = 25.0,
 ) -> Tuple[float, float, float]:
-    """Compute both angle-restriction (F_AR) and balancing (F_B) costs."""
+    """Compute both angle-restriction (F_AR) and balancing (F_B) costs.
+
+    The bearing-angle approximation is intentionally used instead of true
+    spiral pitch angle β.  For all valid log-spiral join nodes, β = alpha_deg
+    by construction, which makes the spec-correct F_AR/F_B values constant
+    across all valid tree states and provides no optimization signal.  The
+    bearing-angle approximation varies with node geometry after perturbation
+    and provides genuine gradient information during optimization.
+    """
     nodes = tree.tree_nodes
     alpha = math.radians(alpha_deg)
 
@@ -1070,19 +1111,7 @@ def compute_f_overlap(
                 seg_a_j, seg_b_j = segs_j
                 D = _pts_to_segs_min_dist(samples, seg_a_j, seg_b_j)  # (n_samples,)
 
-                # F_obs formula applied element-wise
-                mask_deep = D < t
-                mask_buff = (~mask_deep) & (D < t + B)
-
-                if np.any(mask_deep):
-                    d_s = np.maximum(D[mask_deep], 1e-9)
-                    t_s = max(t, 1e-9)
-                    c1  = (t / (B * d_s)) * (B / 2 + t)
-                    c2  = (D[mask_deep] / (B * t_s)) * (B / 2 - t)
-                    cost += float(np.sum(c1 + c2))
-
-                if np.any(mask_buff):
-                    cost += float(np.sum((1.0 - (D[mask_buff] - t) / B) ** 2))
+                cost += float(np.sum(_f_obs_kernel(D, t, B)))
 
     return cost
 

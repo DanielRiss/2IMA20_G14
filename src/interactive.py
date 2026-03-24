@@ -97,7 +97,8 @@ class FlowMapApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("EU Trade Flow Map — Interactive Explorer")
-        root.minsize(1200, 750)
+        root.minsize(275, 700)
+        root.geometry("1200x800")
 
         # ── cached data ────────────────────────────────────────────────────
         self.export_matrix = None
@@ -117,6 +118,7 @@ class FlowMapApp:
         # Width scale slider: integer position 10–500, maps to 0.10×–5.00×
         # (position 100 = 1.00× = default)
         self.width_scale_var = tk.IntVar(value=100)
+        self.exponent_var    = tk.IntVar(value=50)
         self.threshold_var  = tk.IntVar(value=0)
         self.year_var       = tk.StringVar(value=str(AVAILABLE_YEARS[0]))
         self.country_vars   = {c: tk.BooleanVar(value=False) for c in EU27_COUNTRIES}
@@ -151,9 +153,27 @@ class FlowMapApp:
                                sashrelief=tk.RAISED, sashwidth=5)
         paned.pack(fill=tk.BOTH, expand=True)
 
-        # ── left control panel ─────────────────────────────────────────────
-        ctrl = ttk.Frame(paned, padding=8)
-        paned.add(ctrl, width=275)
+        # ── left control panel (scrollable) ────────────────────────────────
+        ctrl_outer = ttk.Frame(paned)
+        paned.add(ctrl_outer, width=285)
+
+        ctrl_canvas = tk.Canvas(ctrl_outer, borderwidth=0, highlightthickness=0)
+        ctrl_vsb = ttk.Scrollbar(ctrl_outer, orient='vertical', command=ctrl_canvas.yview)
+        ctrl_canvas.configure(yscrollcommand=ctrl_vsb.set)
+        ctrl_vsb.pack(side='right', fill='y')
+        ctrl_canvas.pack(side='left', fill='both', expand=True)
+
+        ctrl = ttk.Frame(ctrl_canvas, padding=8)
+        _ctrl_win = ctrl_canvas.create_window((0, 0), window=ctrl, anchor='nw')
+
+        def _on_ctrl_configure(e):
+            ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox('all'))
+        ctrl.bind('<Configure>', _on_ctrl_configure)
+        ctrl_canvas.bind('<Configure>',
+                         lambda e: ctrl_canvas.itemconfig(_ctrl_win, width=e.width))
+        ctrl_canvas.bind_all('<MouseWheel>',
+                             lambda e: ctrl_canvas.yview_scroll(
+                                 int(-1 * e.delta / 120), 'units'))
 
         ttk.Label(ctrl, text="Controls",
                   font=('TkDefaultFont', 11, 'bold')).pack(anchor='w', pady=(0, 4))
@@ -195,13 +215,33 @@ class FlowMapApp:
 
         # Width scale slider (only visible in spiral mode, packed alongside alpha)
         self.width_frame = ttk.LabelFrame(ctrl, text="Edge Width Scale", padding=4)
-        self.width_label = ttk.Label(self.width_frame, text="1.00×")
+
+        # ── collapsible header row ────────────────────────────────────────
+        width_header = ttk.Frame(self.width_frame)
+        width_header.pack(fill='x')
+        self._width_toggle_btn = ttk.Button(width_header, text="\u25bc", width=2,
+                                            command=self._toggle_width_panel)
+        self._width_toggle_btn.pack(side='right')
+
+        # ── collapsible body (starts expanded) ───────────────────────────
+        self._width_body = ttk.Frame(self.width_frame)
+        self._width_body.pack(fill='x', pady=(2, 0))
+
+        self.width_label = ttk.Label(self._width_body, text="1.00×")
         self.width_label.pack(anchor='w')
-        width_sl = ttk.Scale(self.width_frame, from_=10, to=500,
+        width_sl = ttk.Scale(self._width_body, from_=10, to=500,
                              variable=self.width_scale_var, orient='horizontal',
                              command=self._on_width_move)
         width_sl.pack(fill='x')
         width_sl.bind('<ButtonRelease-1>', lambda _e: self._do_redraw())
+        self.power_label = ttk.Label(self._width_body,
+                                     text='Width power: 0.50  (1=linear, 0.5=\u221a)')
+        self.power_label.pack(anchor='w')
+        power_sl = ttk.Scale(self._width_body, from_=10, to=100,
+                             variable=self.exponent_var, orient='horizontal',
+                             command=self._on_power_move)
+        power_sl.pack(fill='x')
+        power_sl.bind('<ButtonRelease-1>', lambda _e: self._on_power_release())
 
         # Threshold
         self.thresh_frame = tf = ttk.LabelFrame(ctrl, text="Min Flow Threshold", padding=4)
@@ -264,12 +304,26 @@ class FlowMapApp:
         # Action buttons
         af = ttk.Frame(ctrl)
         af.pack(fill='x', pady=(4, 0))
-        ttk.Button(af, text="Refresh",     command=self._do_redraw).pack(fill='x', pady=1)
-        ttk.Button(af, text="Reset View",  command=self._reset_view).pack(fill='x', pady=1)
-        ttk.Button(af, text="Save PNG",    command=lambda: self._save('png')).pack(
-            fill='x', pady=1)
-        ttk.Button(af, text="Save SVG",    command=lambda: self._save('svg')).pack(
-            fill='x', pady=1)
+        ttk.Button(af, text="Refresh",    command=self._do_redraw).pack(fill='x', pady=1)
+        ttk.Button(af, text="Reset View", command=self._reset_view).pack(fill='x', pady=1)
+
+        # Save — collapsible, starts collapsed
+        save_frame = ttk.LabelFrame(ctrl, text="Save", padding=4)
+        save_frame.pack(fill='x', pady=2)
+
+        save_header = ttk.Frame(save_frame)
+        save_header.pack(fill='x')
+        self._save_toggle_btn = ttk.Button(save_header, text="\u25b6", width=2,
+                                           command=self._toggle_save_panel)
+        self._save_toggle_btn.pack(side='right')
+
+        self._save_body = ttk.Frame(save_frame)
+        # body NOT packed — collapsed by default
+
+        ttk.Button(self._save_body, text="Save PNG",
+                   command=lambda: self._save('png')).pack(fill='x', pady=1)
+        ttk.Button(self._save_body, text="Save SVG",
+                   command=lambda: self._save('svg')).pack(fill='x', pady=1)
 
         # Status bar
         self.status_var = tk.StringVar(value="Loading…")
@@ -362,8 +416,19 @@ class FlowMapApp:
         of = ttk.LabelFrame(parent, text="Multi-Tree Optimization", padding=4)
         of.pack(fill='x', pady=2)
 
+        # ── collapsible header row ────────────────────────────────────────
+        header = ttk.Frame(of)
+        header.pack(fill='x')
+        self._opt_toggle_btn = ttk.Button(header, text="\u25b6", width=2,
+                                          command=self._toggle_opt_panel)
+        self._opt_toggle_btn.pack(side='right')
+
+        # ── collapsible body (starts hidden) ─────────────────────────────
+        self._opt_body = ttk.Frame(of)
+        # body is NOT packed here — collapsed by default
+
         # Weight sliders (compact, two columns)
-        wf = ttk.Frame(of)
+        wf = ttk.Frame(self._opt_body)
         wf.pack(fill='x', pady=(0, 3))
         self._opt_weight_vars: dict = {}
         for col, (key, label) in enumerate([('c_cross', 'Cross w:'),
@@ -375,7 +440,7 @@ class FlowMapApp:
                                                          padx=(0, 6))
 
         # Iterations entry
-        iter_f = ttk.Frame(of)
+        iter_f = ttk.Frame(self._opt_body)
         iter_f.pack(fill='x', pady=(0, 3))
         ttk.Label(iter_f, text="Max iter:").pack(side='left')
         self._opt_maxiter_var = tk.IntVar(value=300)
@@ -383,7 +448,7 @@ class FlowMapApp:
             side='left', padx=(2, 0))
 
         # Buttons row
-        br = ttk.Frame(of)
+        br = ttk.Frame(self._opt_body)
         br.pack(fill='x')
         self._opt_start_btn = ttk.Button(br, text="Optimize Layout",
                                          command=self._start_opt)
@@ -397,11 +462,35 @@ class FlowMapApp:
 
         # Status label
         self._opt_status_var = tk.StringVar(value="")
-        ttk.Label(of, textvariable=self._opt_status_var,
+        ttk.Label(self._opt_body, textvariable=self._opt_status_var,
                   foreground='#555555', font=('TkDefaultFont', 8),
                   wraplength=240).pack(anchor='w', pady=(2, 0))
 
     # ── optimizer callbacks ──────────────────────────────────────────────────
+
+    def _toggle_opt_panel(self):
+        if self._opt_body.winfo_ismapped():
+            self._opt_body.pack_forget()
+            self._opt_toggle_btn.config(text="\u25b6")
+        else:
+            self._opt_body.pack(fill='x', pady=(2, 0))
+            self._opt_toggle_btn.config(text="\u25bc")
+
+    def _toggle_width_panel(self):
+        if self._width_body.winfo_ismapped():
+            self._width_body.pack_forget()
+            self._width_toggle_btn.config(text="\u25b6")
+        else:
+            self._width_body.pack(fill='x', pady=(2, 0))
+            self._width_toggle_btn.config(text="\u25bc")
+
+    def _toggle_save_panel(self):
+        if self._save_body.winfo_ismapped():
+            self._save_body.pack_forget()
+            self._save_toggle_btn.config(text="\u25b6")
+        else:
+            self._save_body.pack(fill='x', pady=(2, 0))
+            self._save_toggle_btn.config(text="\u25bc")
 
     def _start_opt(self):
         if not self._current_trees:
@@ -537,6 +626,7 @@ class FlowMapApp:
                 xlim=_FULL_XLIM, ylim=_FULL_YLIM,
                 precomputed_trees=trees,
                 width_scale=self.width_scale_var.get() / 100.0,
+                exponent=self.exponent_var.get() / 100.0,
             )
             if zoomed:
                 self.ax.set_xlim(old_xlim)
@@ -588,6 +678,14 @@ class FlowMapApp:
     def _on_width_move(self, value):
         scale = int(float(value)) / 100.0
         self.width_label.config(text=f"{scale:.2f}×")
+
+    def _on_power_move(self, value):
+        exp = int(float(value)) / 100.0
+        self.power_label.config(text=f'Width power: {exp:.2f}  (1=linear, 0.5=√)')
+
+    def _on_power_release(self):
+        invalidate_spiral_cache()
+        self._do_redraw()
 
     def _on_alpha_move(self, value):
         self.alpha_label.config(text=f"{int(float(value))}°")
@@ -740,6 +838,7 @@ class FlowMapApp:
                 world_gdf=self.world_gdf,
                 xlim=_FULL_XLIM, ylim=_FULL_YLIM,
                 width_scale=self.width_scale_var.get() / 100.0,
+                exponent=self.exponent_var.get() / 100.0,
             )
 
             # Restore zoom (render_to_axes resets to full EU)
