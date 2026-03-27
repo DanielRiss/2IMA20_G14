@@ -951,7 +951,7 @@ DEFAULT_F_TOTAL_WEIGHTS: dict = {
     'c_S':       0.4,
     'c_AR':      0.077,
     'c_str':     0.4,
-    'c_cross':   2.0,
+    'c_cross':   0.5,    # reduced from 2.0: less incentive for large crossing-elimination moves
     'c_overlap': 2.0,
 }
 
@@ -1060,6 +1060,7 @@ def _pts_to_segs_min_dist(
 def compute_f_overlap(
     trees: List[SpiralTreeResult],
     total_viz_flow: float,
+    centroids: Dict[str, Tuple[float, float]],
     B: float = _OPT_OVERLAP_B,
     n_samples: int = 6,
 ) -> float:
@@ -1069,9 +1070,26 @@ def compute_f_overlap(
     B             : buffer size in degrees
     n_samples     : sample points per edge
     total_viz_flow: sum of all tree flows (matches draw_spiral_trees width model)
+    centroids     : lon/lat of all country centroids; used to exclude sample
+                    points that are within t of a shared leaf position (countries
+                    that appear as terminals in two or more trees) — these produce
+                    a structural D≈0 singularity that is not a real routing overlap.
     """
     if total_viz_flow <= 0:
         return 0.0
+
+    # Build array of shared leaf positions (lon, lat) — countries terminal in 2+ trees
+    from collections import Counter
+    country_count: Counter = Counter(
+        node.country
+        for tree in trees
+        for node in tree.tree_nodes.values()
+        if node.is_leaf and node.country
+    )
+    shared_lonlat = np.array(
+        [centroids[c] for c, cnt in country_count.items() if cnt >= 2 and c in centroids],
+        dtype=float,
+    )   # shape (K, 2) or (0, 2)
 
     # Pre-stack all segments for each tree as (seg_a, seg_b) pairs
     tree_segs: List[Optional[tuple]] = []
@@ -1105,12 +1123,27 @@ def compute_f_overlap(
             idx = np.round(np.linspace(0, len(arr) - 1, n_samples)).astype(int)
             samples = arr[idx]   # (n_samples, 2)
 
+            # Exclude sample points within t° of any shared leaf centroid.
+            # Those points have D≈0 by construction (both trees terminate there),
+            # causing a 1/D singularity that is not a genuine routing overlap.
+            if shared_lonlat.shape[0] > 0:
+                dist_to_shared = np.min(
+                    np.hypot(
+                        samples[:, 0:1] - shared_lonlat[:, 0],
+                        samples[:, 1:2] - shared_lonlat[:, 1],
+                    ),
+                    axis=1,
+                )   # (n_samples,)
+                samples = samples[dist_to_shared >= t]
+            if len(samples) == 0:
+                continue
+
             for tj, segs_j in enumerate(tree_segs):
                 if ti == tj or segs_j is None:
                     continue
                 seg_a_j, seg_b_j = segs_j
-                D = _pts_to_segs_min_dist(samples, seg_a_j, seg_b_j)  # (n_samples,)
-
+                D = _pts_to_segs_min_dist(samples, seg_a_j, seg_b_j)  # (n_kept,)
+                D = np.maximum(D, t * 0.1)                              # clamp: bound max penalty per crossing
                 cost += float(np.sum(_f_obs_kernel(D, t, B)))
 
     return cost
@@ -1161,7 +1194,7 @@ def compute_inter_tree_cost(
     total_viz_flow = sum(t.total_flow for t in trees) or 1.0
     f_cross   = compute_f_cross(trees)
     f_overlap = compute_f_overlap(
-        trees, total_viz_flow, B=B_obs, n_samples=n_overlap_samples
+        trees, total_viz_flow, cents, B=B_obs, n_samples=n_overlap_samples
     )
 
     # ── f_total via compute_f_total ───────────────────────────────────────
@@ -1219,7 +1252,7 @@ def compute_f_total(
     total_viz_flow = sum(t.total_flow for t in trees) or 1.0
     total += w['c_cross']   * compute_f_cross(trees)
     total += w['c_overlap'] * compute_f_overlap(
-        trees, total_viz_flow, B=B_obs, n_samples=n_overlap_samples
+        trees, total_viz_flow, centroids, B=B_obs, n_samples=n_overlap_samples
     )
 
     return total
@@ -1233,7 +1266,7 @@ def optimize_multi_tree(
     stop_event: _threading.Event,
     on_update: Callable[[int, float, List['SpiralTreeResult']], None],
     weights: Optional[dict] = None,
-    max_iter: int = 300,
+    max_iter: int = 2000,
     T_init: float = 5.0,
     T_min: float  = 1e-3,
     update_every: int = 10,
@@ -1254,6 +1287,11 @@ def optimize_multi_tree(
     w     = {**DEFAULT_F_TOTAL_WEIGHTS, **(weights or {})}
     state = _copy.deepcopy(trees)
 
+    try:
+        from shapely.geometry import LineString as _LineString
+    except ImportError:
+        _LineString = None
+
     # Source EPSG:3035 absolute positions
     src_xy: Dict[int, Tuple[float, float]] = {}
     for ti, tree in enumerate(state):
@@ -1272,14 +1310,26 @@ def optimize_multi_tree(
         on_update(-1, 0.0, state)
         return
 
+    # Store original (x, y) of every Steiner node for cumulative displacement constraint
+    orig_positions: Dict[Tuple[int, int], Tuple[float, float]] = {
+        (ti, nid): (node.x, node.y)
+        for ti, tree in enumerate(state)
+        for nid, node in tree.tree_nodes.items()
+        if node.is_steiner
+    }
+
     total_viz_flow = sum(t.total_flow for t in state) or 1.0
 
     def _full_cost() -> float:
         return compute_f_total(state, centroids, alpha_deg, w, B_obs, n_overlap_samples)
 
     current_cost = _full_cost()
-    alpha = (T_min / T_init) ** (1.0 / max(max_iter, 1))
-    T     = T_init
+    # Fix 3: calibrate T_init dynamically so a 1%-of-F_total uphill move
+    # has ~25% acceptance probability at t=0.
+    # T = -delta / ln(p)  =>  T = (0.01 * F) / ln(4)
+    T_init = (0.01 * current_cost) / math.log(1.0 / 0.25)
+    alpha  = (T_min / T_init) ** (1.0 / max(max_iter, 1))
+    T      = T_init
 
     for it in range(max_iter):
         if stop_event.is_set():
@@ -1290,25 +1340,49 @@ def optimize_multi_tree(
         node     = tree.tree_nodes[nid]
         sx, sy   = src_xy[ti]
 
-        # Adaptive step: 10% of current R or at least 20 km in projection units
-        step  = max(node.R * 0.10, 20_000.0)
-        new_x = node.x + _random.gauss(0.0, step)
-        new_y = node.y + _random.gauss(0.0, step)
-        new_R, new_phi = _polar(new_x, new_y)
+        # Fix 1: classify node type at perturbation time
+        is_subdivision = (len(node.children) == 1)
+
+        # Fix 2 + Fix 4: step size scales with t_frac = T/T_init
+        # (large exploration early, fine refinement late)
+        t_frac = T / T_init
+        if is_subdivision:
+            # Rotate around source: perturb phi only, keep R fixed
+            step_angle = max(0.10 * t_frac, 0.001)
+            new_phi    = node.phi + _random.gauss(0.0, step_angle)
+            new_x, new_y = _cart(node.R, new_phi)
+            new_R      = node.R
+        else:
+            # Join node: free translation in (x, y)
+            step  = max(node.R * 0.10 * t_frac, 500.0)
+            new_x = node.x + _random.gauss(0.0, step)
+            new_y = node.y + _random.gauss(0.0, step)
+            new_R, new_phi = _polar(new_x, new_y)
 
         if new_R < 10_000.0:      # too close to source — reject
             T *= alpha
             continue
 
-        # Enforce R hierarchy: Steiner.R < min(children.R), > parent.R
-        valid = all(tree.tree_nodes[c].R > new_R for c in node.children)
-        if valid and node.parent is not None:
+        # Clamp new_R to valid R-hierarchy window (join nodes only).
+        # Subdivision nodes already have new_R == node.R (fixed), so skip.
+        if not is_subdivision:
+            R_children_min = min(tree.tree_nodes[c].R for c in node.children) * 0.999
+            par            = tree.tree_nodes[node.parent] if node.parent is not None else None
+            R_parent_min   = (par.R * 1.001 if par is not None and par.R > 0 else 0.0)
+            if R_parent_min >= R_children_min:   # degenerate window — skip
+                T *= alpha
+                continue
+            if new_R < R_parent_min or new_R > R_children_min:
+                new_R        = min(max(new_R, R_parent_min), R_children_min)
+                new_x, new_y = _cart(new_R, new_phi)
+
+        # R-hierarchy must hold after clamping — violation here is a bug
+        assert all(tree.tree_nodes[c].R > new_R for c in node.children), \
+            f"R-hierarchy violated: child R <= new_R={new_R}"
+        if node.parent is not None:
             par = tree.tree_nodes[node.parent]
-            if par.R > 0 and par.R >= new_R:
-                valid = False
-        if not valid:
-            T *= alpha
-            continue
+            assert par.R <= 0 or par.R < new_R, \
+                f"R-hierarchy violated: parent R={par.R} >= new_R={new_R}"
 
         # Save state of affected edges (those incident to this node)
         orig_pos   = (node.x, node.y, node.R, node.phi)
@@ -1331,6 +1405,48 @@ def optimize_multi_tree(
 
         # Metropolis acceptance criterion
         if delta < 0 or _random.random() < math.exp(-delta / max(T, 1e-12)):
+            # Guard: reject if the move introduces a new intra-tree crossing.
+            # Check each incident (resampled) edge against every non-incident edge.
+            incident_idx     = set(orig_edges.keys())
+            non_incident_idx = [
+                i for i in range(len(tree.edges))
+                if i not in incident_idx and len(tree.edge_polylines[i]) >= 2
+            ]
+            new_intra = False
+            if _LineString is not None:
+                for ai in incident_idx:
+                    if len(tree.edge_polylines[ai]) < 2:
+                        continue
+                    line_a      = _LineString(tree.edge_polylines[ai])  # post-move
+                    orig_line_a = _LineString(orig_edges[ai])           # pre-move
+                    for bi in non_incident_idx:
+                        line_b = _LineString(tree.edge_polylines[bi])   # unchanged
+                        try:
+                            crosses_after  = line_a.crosses(line_b)
+                            crosses_before = orig_line_a.crosses(line_b)
+                        except Exception:
+                            continue
+                        if crosses_after and not crosses_before:
+                            new_intra = True
+                            break
+                    if new_intra:
+                        break
+            if new_intra:
+                node.x, node.y, node.R, node.phi = orig_pos
+                for i, pts in orig_edges.items():
+                    tree.edge_polylines[i] = pts
+                T *= alpha
+                continue
+            # Guard: reject if cumulative displacement from original position
+            # exceeds 50% of the node's current radius.
+            ox, oy     = orig_positions[(ti, nid)]
+            cumul_disp = math.hypot(node.x - ox, node.y - oy)
+            if cumul_disp > node.R * 0.5:
+                node.x, node.y, node.R, node.phi = orig_pos
+                for i, pts in orig_edges.items():
+                    tree.edge_polylines[i] = pts
+                T *= alpha
+                continue
             current_cost = new_cost
         else:
             # Revert

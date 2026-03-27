@@ -8,7 +8,7 @@ Checks:
   4. DEFAULT_OPT_WEIGHTS references in the codebase
 """
 import os, sys, math, threading, pathlib
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 from data_loader import load_trade_data
 from map_utils   import load_eu_map, get_centroids

@@ -443,7 +443,7 @@ class FlowMapApp:
         iter_f = ttk.Frame(self._opt_body)
         iter_f.pack(fill='x', pady=(0, 3))
         ttk.Label(iter_f, text="Max iter:").pack(side='left')
-        self._opt_maxiter_var = tk.IntVar(value=300)
+        self._opt_maxiter_var = tk.IntVar(value=2000)
         ttk.Entry(iter_f, textvariable=self._opt_maxiter_var, width=6).pack(
             side='left', padx=(2, 0))
 
