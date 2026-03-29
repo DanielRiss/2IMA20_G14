@@ -263,6 +263,11 @@ class FlowMapApp:
         cf = ttk.LabelFrame(ctrl, text="Source Countries", padding=4)
         cf.pack(fill='both', expand=True, pady=2)
 
+        # Instruction label
+        ttk.Label(cf, text="Select sources, then click Refresh",
+                  font=('TkDefaultFont', 8), foreground='#666666').pack(
+            anchor='w', pady=(0, 2))
+
         # Focus mode toggle
         focus_cb = ttk.Checkbutton(
             cf, text="Focus: only flows between selected",
@@ -274,6 +279,11 @@ class FlowMapApp:
         ttk.Button(btn_row, text="Select All", command=self._select_all).pack(
             side='left', padx=(0, 3))
         ttk.Button(btn_row, text="Clear All",  command=self._clear_all).pack(side='left')
+
+        # Selection summary label — packed before canvas so side='bottom' claims space first
+        self._selection_label = ttk.Label(cf, text="0 sources selected",
+                                          font=('TkDefaultFont', 8), foreground='#444444')
+        self._selection_label.pack(side='bottom', anchor='w', pady=(2, 0))
 
         sc = tk.Canvas(cf, borderwidth=0, highlightthickness=0)
         vsb = ttk.Scrollbar(cf, orient='vertical', command=sc.yview)
@@ -294,7 +304,7 @@ class FlowMapApp:
         for country in EU27_COUNTRIES:
             cb = ttk.Checkbutton(self._country_inner, text=country,
                                  variable=self.country_vars[country],
-                                 command=self._schedule_redraw)
+                                 command=self._on_country_toggle)
             cb.pack(anchor='w', pady=1)
             self._country_checkbuttons[country] = cb
 
@@ -558,6 +568,9 @@ class FlowMapApp:
             self._opt_status_var.set(f"Iter {it}  |  cost: {cost:.3f}")
 
         self._redraw_with_trees(trees)
+        _, net_mx, _ = self._get_effective_data()
+        threshold    = slider_to_threshold(self.threshold_var.get())
+        self._update_stats(trees, net_mx, threshold)
 
     def _stop_opt(self):
         self._opt_stop.set()
@@ -969,17 +982,49 @@ class FlowMapApp:
         else:
             lbl.configure(foreground='#cc2222')
 
+    # ── country toggle (no auto-rebuild) ─────────────────────────────────────
+
+    def _on_country_toggle(self):
+        """Checkbox callback: invalidates optimisation state but does NOT redraw.
+        The user must click Refresh to trigger tree construction."""
+        if self._opt_thread is not None and self._opt_thread.is_alive():
+            self._opt_stop.set()
+        self._opt_trees      = None
+        self._opt_orig_trees = None
+        if hasattr(self, '_opt_reset_btn'):
+            self._opt_reset_btn.config(state='disabled')
+        self._update_selection_label()
+
+    def _update_selection_label(self):
+        """Refresh the 'N sources selected — X B EUR' summary label."""
+        selected = [c for c, v in self.country_vars.items() if v.get()]
+        n = len(selected)
+        if self.net_matrix is not None and n > 0:
+            total_m = 0.0
+            for c in selected:
+                if c in self.net_matrix.index:
+                    row = self.net_matrix.loc[c]
+                    total_m += float(
+                        row.drop(c, errors='ignore').clip(lower=0).sum()
+                    )
+            total_b = total_m / 1000.0
+            text = (f"{n} source{'s' if n != 1 else ''} selected"
+                    f" — {total_b:,.0f} B EUR total flow")
+        else:
+            text = f"{n} source{'s' if n != 1 else ''} selected"
+        self._selection_label.config(text=text)
+
     # ── select / clear ───────────────────────────────────────────────────────
 
     def _select_all(self):
         for v in self.country_vars.values():
             v.set(True)
-        self._schedule_redraw()
+        self._on_country_toggle()
 
     def _clear_all(self):
         for v in self.country_vars.values():
             v.set(False)
-        self._schedule_redraw()
+        self._on_country_toggle()
 
     # ── save ─────────────────────────────────────────────────────────────────
 

@@ -9,7 +9,8 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 from map_utils import render_basemap
-from spiral_tree import compute_spiral_tree, draw_spiral_trees
+from spiral_tree import (compute_spiral_tree, draw_spiral_trees,
+                         PRIOR_TREE_OBSTACLE_M, _to3035)
 
 # Color palette for up to 10 source countries
 SOURCE_COLORS = [
@@ -84,9 +85,17 @@ def render_to_axes(
             cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode, exponent)
             if cache_key not in _SPIRAL_CACHE:
                 trees = []
-                for src in sources:
-                    if src not in matrix.index:
-                        continue
+                # Build in descending total-flow order so the highest-volume tree
+                # is constructed first and acts as obstacles for later trees.
+                sources_sorted = sorted(
+                    [s for s in sources if s in matrix.index],
+                    key=lambda s: float(
+                        matrix.loc[s].drop(s, errors='ignore').clip(lower=0).sum()
+                    ),
+                    reverse=True,
+                )
+                built_trees = []  # list of (SpiralTreeResult, src_x_3035, src_y_3035)
+                for src in sources_sorted:
                     row = matrix.loc[src]
                     net_flows = {
                         dst: float(v) for dst, v in row.items()
@@ -94,15 +103,30 @@ def render_to_axes(
                     }
                     if not net_flows:
                         continue
+                    src_lon, src_lat = centroids[src]
+                    new_sx, new_sy = _to3035(src_lon, src_lat)
+                    # Convert previously-built trees' Steiner and leaf nodes into
+                    # this tree's local coordinate space as 50km exclusion zones.
+                    prior_obstacles = []
+                    for prev_tree, prev_sx, prev_sy in built_trees:
+                        for node in prev_tree.tree_nodes.values():
+                            if node.is_steiner or node.is_leaf:
+                                local_x = (prev_sx + node.x) - new_sx
+                                local_y = (prev_sy + node.y) - new_sy
+                                prior_obstacles.append(
+                                    (local_x, local_y, PRIOR_TREE_OBSTACLE_M)
+                                )
                     result = compute_spiral_tree(
                         source_name=src,
                         terminal_names=list(net_flows.keys()),
                         net_flows=net_flows,
                         centroids=centroids,
-                        obstacle_names=[s for s in sources if s != src],
+                        obstacle_names=[s for s in sources_sorted if s != src],
                         alpha_deg=alpha_deg,
                         exponent=exponent,
+                        prior_obstacles=prior_obstacles,
                     )
+                    built_trees.append((result, new_sx, new_sy))
                     trees.append(result)
                 _SPIRAL_CACHE[cache_key] = trees
             else:

@@ -47,6 +47,8 @@ LEAF_OBSTACLE_M    =  30_000.0
 N_SPIRAL_SAMPLES   = 40
 MIN_W_FRAC         = 0.05
 MIN_HW_DISPLAY_DEG = 0.005        # ~555 m — absolute display floor in degrees
+MIN_EDGE_FOR_SUBDIVISION_M = 150_000.0  # 150 km — edges longer than this get one midpoint subdivision node
+PRIOR_TREE_OBSTACLE_M     =  50_000.0  # 50 km — exclusion zone around previously-built trees' nodes
 
 
 # ── coordinate helpers ───────────────────────────────────────────────────────
@@ -396,6 +398,82 @@ def _assign_widths(nodes: Dict[int, TreeNode], root_id: int, exponent: float = 0
             n.width = min_w
 
 
+# ── subdivision node insertion ────────────────────────────────────────────────
+
+def _insert_subdivision_nodes(
+    tree_nodes: Dict[int, TreeNode],
+    edges: List[Tuple[int, int]],
+    edge_polylines: List[List[Tuple[float, float]]],
+    min_edge_m: float,
+) -> int:
+    """Insert one subdivision node at the midpoint of every edge longer than min_edge_m.
+
+    Modifies tree_nodes, edges, and edge_polylines in-place.
+    Returns the number of subdivision nodes inserted.
+    """
+    n_inserted = 0
+    i = 0
+    while i < len(edges):
+        child_id, parent_id = edges[i]
+        c_node = tree_nodes[child_id]
+        p_node = tree_nodes[parent_id]
+
+        length = math.hypot(c_node.x - p_node.x, c_node.y - p_node.y)
+        if length < min_edge_m:
+            i += 1
+            continue
+
+        c_R, c_phi = c_node.R, c_node.phi
+        p_R, p_phi = p_node.R, p_node.phi
+
+        if c_R <= 0 or p_R <= 0:
+            i += 1
+            continue
+        t_end = math.log(c_R / p_R)
+        if abs(t_end) < 1e-12:
+            i += 1
+            continue
+
+        tan_beta = (p_phi - c_phi) / t_end
+        t_mid    = 0.5 * t_end
+        R_mid    = c_R * math.exp(-t_mid)
+        phi_mid  = c_phi + tan_beta * t_mid
+        x_mid, y_mid = _cart(R_mid, phi_mid)
+
+        new_id = max(tree_nodes.keys()) + 1
+        sub_node = TreeNode(
+            node_id   = new_id,
+            R         = R_mid,
+            phi       = phi_mid,
+            x         = x_mid,
+            y         = y_mid,
+            is_steiner= True,
+            is_leaf   = False,
+            parent    = parent_id,
+            children  = [child_id],
+            width     = c_node.width,
+            weight    = 0.0,
+            country   = None,
+        )
+        tree_nodes[new_id] = sub_node
+
+        c_node.parent = new_id
+        children = p_node.children
+        children[children.index(child_id)] = new_id
+
+        pts = edge_polylines[i]
+        mid = len(pts) // 2
+        edges[i]          = (child_id, new_id)
+        edge_polylines[i] = pts[:mid + 1]
+        edges.insert(i + 1, (new_id, parent_id))
+        edge_polylines.insert(i + 1, pts[mid:])
+
+        n_inserted += 1
+        # do NOT increment i — next iteration re-examines edges[i] = (child_id, new_id)
+
+    return n_inserted
+
+
 # ── spiral edge sampling ──────────────────────────────────────────────────────
 
 def _sample_spiral(
@@ -488,6 +566,7 @@ def compute_spiral_tree(
     obstacle_names: List[str],
     alpha_deg: float = 25.0,
     exponent: float = 0.5,
+    prior_obstacles: Optional[List[Tuple[float, float, float]]] = None,
 ) -> SpiralTreeResult:
     """Compute a spiral tree for one source country."""
     tan_a = math.tan(math.radians(alpha_deg))
@@ -540,6 +619,8 @@ def compute_spiral_tree(
         obstacles.append((ox - sx, oy - sy, OBSTACLE_RADIUS_M))
     for name, flow, R, phi, dx, dy in raw_terminals:
         obstacles.append((dx, dy, LEAF_OBSTACLE_M))
+    if prior_obstacles:
+        obstacles.extend(prior_obstacles)
 
     tree_nodes = _build_tree(
         source_id=0, leaf_nodes=leaf_nodes, rotated_phi=rotated_phi,
@@ -559,6 +640,9 @@ def compute_spiral_tree(
         pts = _sample_spiral(c_node.R, c_node.phi,
                              p_node.R, p_node.phi, sx, sy)
         edge_polylines.append(pts)
+
+    # Insert subdivision nodes along long edges (modifies tree_nodes, edges, edge_polylines in-place)
+    _insert_subdivision_nodes(tree_nodes, edges, edge_polylines, MIN_EDGE_FOR_SUBDIVISION_M)
 
     total_flow = sum(n.weight for n in tree_nodes.values() if n.is_leaf)
 
@@ -951,8 +1035,8 @@ DEFAULT_F_TOTAL_WEIGHTS: dict = {
     'c_S':       0.4,
     'c_AR':      0.077,
     'c_str':     0.4,
-    'c_cross':   0.5,    # reduced from 2.0: less incentive for large crossing-elimination moves
-    'c_overlap': 2.0,
+    'c_cross':   0.0,    # disabled: optimizer focuses on single-tree quality only
+    'c_overlap': 0.0,    # disabled: inter-tree conflicts not resolved by SA
 }
 
 _OPT_M_PER_DEG = 111_000.0
@@ -1258,6 +1342,49 @@ def compute_f_total(
     return total
 
 
+# ── subdivision-node analytical smoother ─────────────────────────────────────
+
+def _smooth_subdivision_nodes(
+    tree: SpiralTreeResult,
+    src_x: float,
+    src_y: float,
+) -> None:
+    """Two-pass Gauss-Seidel smoothing of subdivision nodes to minimise F_S pitch discontinuity.
+
+    Pass 1 (ascending R, parent->child): propagates parent phi downward.
+    Pass 2 (descending R, child->parent): propagates child phi upward.
+    Then resamples all edge polylines incident on any subdivision node.
+    """
+    nodes = tree.tree_nodes
+    sub_nodes = sorted(
+        [n for n in nodes.values() if n.is_steiner and len(n.children) == 1],
+        key=lambda n: n.R,
+    )
+    if not sub_nodes:
+        return
+
+    for pass_nodes in (sub_nodes, list(reversed(sub_nodes))):
+        for s in pass_nodes:
+            c = nodes[s.children[0]]
+            p = nodes[s.parent]
+            log_cp = math.log(c.R / p.R)
+            if abs(log_cp) < 1e-12:
+                continue
+            w_c = math.log(s.R / p.R)
+            w_p = math.log(c.R / s.R)
+            s.phi = (c.phi * w_c + p.phi * w_p) / log_cp
+            s.x, s.y = _cart(s.R, s.phi)
+
+    sub_ids = {n.node_id for n in sub_nodes}
+    for i, (c_id, p_id) in enumerate(tree.edges):
+        if c_id in sub_ids or p_id in sub_ids:
+            c_node = nodes[c_id]
+            p_node = nodes[p_id]
+            new_pts = _sample_spiral(c_node.R, c_node.phi, p_node.R, p_node.phi, src_x, src_y)
+            if new_pts:
+                tree.edge_polylines[i] = new_pts
+
+
 # ── simulated annealing optimizer ────────────────────────────────────────────
 
 def optimize_multi_tree(
@@ -1273,6 +1400,7 @@ def optimize_multi_tree(
     alpha_deg: float = 25.0,
     B_obs: float = _OPT_OVERLAP_B,
     n_overlap_samples: int = 6,
+    gd_iters: int = 200,
 ) -> None:
     """Simulated annealing to reduce inter-tree crossings and overlaps.
 
@@ -1298,12 +1426,13 @@ def optimize_multi_tree(
         lon, lat    = centroids[tree.source_name]
         src_xy[ti]  = _to3035(lon, lat)
 
-    # Pool of (tree_idx, node_id) for all Steiner nodes
+    # Pool of (tree_idx, node_id) for join nodes only (subdivision nodes are
+    # handled analytically by _smooth_subdivision_nodes after each accepted move)
     steiner_pool: List[Tuple[int, int]] = [
         (ti, nid)
         for ti, tree in enumerate(state)
         for nid, node in tree.tree_nodes.items()
-        if node.is_steiner
+        if node.is_steiner and len(node.children) >= 2
     ]
 
     if not steiner_pool:
@@ -1331,50 +1460,43 @@ def optimize_multi_tree(
     alpha  = (T_min / T_init) ** (1.0 / max(max_iter, 1))
     T      = T_init
 
-    for it in range(max_iter):
+    for it in range(max_iter + gd_iters):
         if stop_event.is_set():
             break
+
+        # Switch to greedy-descent mode after SA phase
+        if it == max_iter:
+            T = 1e-15
 
         ti, nid = _random.choice(steiner_pool)
         tree     = state[ti]
         node     = tree.tree_nodes[nid]
         sx, sy   = src_xy[ti]
 
-        # Fix 1: classify node type at perturbation time
-        is_subdivision = (len(node.children) == 1)
-
-        # Fix 2 + Fix 4: step size scales with t_frac = T/T_init
-        # (large exploration early, fine refinement late)
+        # All pool nodes are join nodes — free translation in (x, y)
+        # Step size scales with t_frac = T/T_init (large early, fine late)
         t_frac = T / T_init
-        if is_subdivision:
-            # Rotate around source: perturb phi only, keep R fixed
-            step_angle = max(0.10 * t_frac, 0.001)
-            new_phi    = node.phi + _random.gauss(0.0, step_angle)
-            new_x, new_y = _cart(node.R, new_phi)
-            new_R      = node.R
-        else:
-            # Join node: free translation in (x, y)
-            step  = max(node.R * 0.10 * t_frac, 500.0)
-            new_x = node.x + _random.gauss(0.0, step)
-            new_y = node.y + _random.gauss(0.0, step)
-            new_R, new_phi = _polar(new_x, new_y)
+        step  = max(node.R * 0.10 * t_frac, 500.0)
+        new_x = node.x + _random.gauss(0.0, step)
+        new_y = node.y + _random.gauss(0.0, step)
+        new_R, new_phi = _polar(new_x, new_y)
 
         if new_R < 10_000.0:      # too close to source — reject
-            T *= alpha
+            if it < max_iter:
+                T *= alpha
             continue
 
-        # Clamp new_R to valid R-hierarchy window (join nodes only).
-        # Subdivision nodes already have new_R == node.R (fixed), so skip.
-        if not is_subdivision:
-            R_children_min = min(tree.tree_nodes[c].R for c in node.children) * 0.999
-            par            = tree.tree_nodes[node.parent] if node.parent is not None else None
-            R_parent_min   = (par.R * 1.001 if par is not None and par.R > 0 else 0.0)
-            if R_parent_min >= R_children_min:   # degenerate window — skip
+        # Clamp new_R to valid R-hierarchy window for join nodes
+        R_children_min = min(tree.tree_nodes[c].R for c in node.children) * 0.999
+        par            = tree.tree_nodes[node.parent] if node.parent is not None else None
+        R_parent_min   = (par.R * 1.001 if par is not None and par.R > 0 else 0.0)
+        if R_parent_min >= R_children_min:   # degenerate window — skip
+            if it < max_iter:
                 T *= alpha
-                continue
-            if new_R < R_parent_min or new_R > R_children_min:
-                new_R        = min(max(new_R, R_parent_min), R_children_min)
-                new_x, new_y = _cart(new_R, new_phi)
+            continue
+        if new_R < R_parent_min or new_R > R_children_min:
+            new_R        = min(max(new_R, R_parent_min), R_children_min)
+            new_x, new_y = _cart(new_R, new_phi)
 
         # R-hierarchy must hold after clamping — violation here is a bug
         assert all(tree.tree_nodes[c].R > new_R for c in node.children), \
@@ -1435,7 +1557,8 @@ def optimize_multi_tree(
                 node.x, node.y, node.R, node.phi = orig_pos
                 for i, pts in orig_edges.items():
                     tree.edge_polylines[i] = pts
-                T *= alpha
+                if it < max_iter:
+                    T *= alpha
                 continue
             # Guard: reject if cumulative displacement from original position
             # exceeds 50% of the node's current radius.
@@ -1445,16 +1568,20 @@ def optimize_multi_tree(
                 node.x, node.y, node.R, node.phi = orig_pos
                 for i, pts in orig_edges.items():
                     tree.edge_polylines[i] = pts
-                T *= alpha
+                if it < max_iter:
+                    T *= alpha
                 continue
             current_cost = new_cost
+            # Part 2: analytically smooth subdivision nodes in the affected tree
+            _smooth_subdivision_nodes(tree, *src_xy[ti])
         else:
             # Revert
             node.x, node.y, node.R, node.phi = orig_pos
             for i, pts in orig_edges.items():
                 tree.edge_polylines[i] = pts
 
-        T *= alpha
+        if it < max_iter:
+            T *= alpha
 
         if (it + 1) % update_every == 0:
             on_update(it + 1, current_cost, _copy.deepcopy(state))
