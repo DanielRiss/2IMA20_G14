@@ -22,6 +22,29 @@ SOURCE_COLORS = [
 _SPIRAL_CACHE: dict = {}
 
 
+def disparity_filter(flows: dict, alpha: float) -> dict:
+    """Retain only statistically significant flows using Serrano et al. disparity filter.
+
+    flows: dict of {destination: flow_value}, all values must be > 0
+    alpha: significance level (default 0.15, lower = stricter)
+    Returns filtered dict keeping only flows where (1 - p_ij)^(k-1) <= alpha
+    """
+    if not flows:
+        return flows
+    total = sum(flows.values())
+    if total <= 0:
+        return flows
+    k = len(flows)
+    if k <= 1:
+        return flows  # cannot apply filter with 0 or 1 partners
+    result = {}
+    for dst, v in flows.items():
+        p_ij = v / total
+        if (1 - p_ij) ** (k - 1) <= alpha:
+            result[dst] = v
+    return result
+
+
 def render_to_axes(
     ax,
     eu_gdf,
@@ -41,6 +64,7 @@ def render_to_axes(
     precomputed_trees=None,
     width_scale=1.0,
     exponent=0.5,
+    disparity_alpha=0.15,
 ) -> list:
     """
     Draw a multi-source flow map onto an existing matplotlib Axes.
@@ -82,7 +106,7 @@ def render_to_axes(
             # Use caller-supplied trees (e.g. after inter-tree optimisation)
             trees = precomputed_trees
         else:
-            cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode, exponent)
+            cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode, exponent, disparity_alpha)
             if cache_key not in _SPIRAL_CACHE:
                 trees = []
                 # Build in descending total-flow order so the highest-volume tree
@@ -101,6 +125,7 @@ def render_to_axes(
                         dst: float(v) for dst, v in row.items()
                         if dst != src and float(v) > threshold_meur
                     }
+                    net_flows = disparity_filter(net_flows, alpha=disparity_alpha)
                     if not net_flows:
                         continue
                     src_lon, src_lat = centroids[src]

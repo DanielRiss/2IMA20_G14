@@ -117,9 +117,10 @@ class FlowMapApp:
         self.alpha_var      = tk.IntVar(value=25)
         # Width scale slider: integer position 10–500, maps to 0.10×–5.00×
         # (position 100 = 1.00× = default)
-        self.width_scale_var = tk.IntVar(value=100)
-        self.exponent_var    = tk.IntVar(value=50)
-        self.threshold_var  = tk.IntVar(value=0)
+        self.width_scale_var    = tk.IntVar(value=100)
+        self.exponent_var       = tk.IntVar(value=50)
+        self.threshold_var      = tk.IntVar(value=0)
+        self.disparity_alpha_var = tk.DoubleVar(value=0.15)
         self.year_var       = tk.StringVar(value=str(AVAILABLE_YEARS[0]))
         self.country_vars   = {c: tk.BooleanVar(value=False) for c in EU27_COUNTRIES}
         self.focus_var      = tk.BooleanVar(value=False)
@@ -253,6 +254,18 @@ class FlowMapApp:
                               command=self._on_slider_move)
         thresh_sl.pack(fill='x')
         thresh_sl.bind('<ButtonRelease-1>', lambda _e: self._do_redraw())
+
+        # Disparity filter
+        df = ttk.LabelFrame(ctrl, text="Disparity Filter", padding=4)
+        df.pack(fill='x', pady=2)
+        self.disparity_label = ttk.Label(df, text="Disparity α: 0.15")
+        self.disparity_label.pack(anchor='w')
+        disparity_sl = ttk.Scale(df, from_=0.05, to=0.50,
+                                 variable=self.disparity_alpha_var,
+                                 orient='horizontal',
+                                 command=self._on_disparity_move)
+        disparity_sl.pack(fill='x')
+        disparity_sl.bind('<ButtonRelease-1>', lambda _e: self._on_disparity_release())
 
         # Country groups
         self.groups_outer = ttk.LabelFrame(ctrl, text="Country Groups", padding=4)
@@ -640,6 +653,7 @@ class FlowMapApp:
                 precomputed_trees=trees,
                 width_scale=self.width_scale_var.get() / 100.0,
                 exponent=self.exponent_var.get() / 100.0,
+                disparity_alpha=self.disparity_alpha_var.get(),
             )
             if zoomed:
                 self.ax.set_xlim(old_xlim)
@@ -714,6 +728,13 @@ class FlowMapApp:
 
     def _on_slider_move(self, value):
         self.thresh_label.config(text=threshold_to_label(int(float(value))))
+
+    def _on_disparity_move(self, value):
+        self.disparity_label.config(text=f"Disparity α: {float(value):.2f}")
+
+    def _on_disparity_release(self):
+        invalidate_spiral_cache()
+        self._do_redraw()
 
     # ── canvas mouse release (toolbar zoom/pan end) ─────────────────────────
 
@@ -852,6 +873,7 @@ class FlowMapApp:
                 xlim=_FULL_XLIM, ylim=_FULL_YLIM,
                 width_scale=self.width_scale_var.get() / 100.0,
                 exponent=self.exponent_var.get() / 100.0,
+                disparity_alpha=self.disparity_alpha_var.get(),
             )
 
             # Restore zoom (render_to_axes resets to full EU)

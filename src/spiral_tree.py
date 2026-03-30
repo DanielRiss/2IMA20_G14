@@ -660,7 +660,7 @@ def draw_spiral_trees(
     trees: List[SpiralTreeResult],
     centroids: Dict[str, Tuple[float, float]],
     color_map: Dict[str, str],
-    alpha: float = 0.75,
+    alpha: float = 1.0,
     width_scale: float = 1.0,
     exponent: float = 0.5,
 ) -> None:
@@ -695,6 +695,7 @@ def draw_spiral_trees(
         color    = color_map.get(tree.source_name, '#333333')
         nodes    = tree.tree_nodes
         src_lon, src_lat = centroids[tree.source_name]
+        src_x, src_y     = _to3035(src_lon, src_lat)
 
         # max_w = widest edge child in this tree (= root-adjacent Steiner ≈ root)
         max_w = max((nodes[c].width for c, _ in tree.edges), default=0.0)
@@ -713,15 +714,33 @@ def draw_spiral_trees(
             if abs(c_node.R - p_node.R) < 1.0:
                 continue
 
-            # half-width in degrees: (this edge's flow / total viz flow) * scale
-            hw = (c_node.width / 2.0 * flow_scale) / m_per_deg * width_scale
-            hw = max(hw, MIN_HW_DISPLAY_DEG)   # absolute display floor
+            # tapered half-widths: child end → parent end
+            hw_child  = max((c_node.width / 2.0 * flow_scale) / m_per_deg * width_scale, MIN_HW_DISPLAY_DEG)
+            hw_parent = max((p_node.width / 2.0 * flow_scale) / m_per_deg * width_scale, MIN_HW_DISPLAY_DEG)
 
-            patch = _edge_polygon(pts, hw, hw, color, alpha=alpha)
+            patch = _edge_polygon(pts, hw_child, hw_parent, color, alpha=alpha)
             if patch is not None:
                 ax.add_patch(patch)
 
-        # ── source marker ────────────────────────────────────────────────────
+        # ── Steiner node discs (cover gaps at junctions) ─────────────────────
+        for node in nodes.values():
+            if not node.is_steiner or node.parent is None:
+                continue
+            hw_node = max((node.width / 2.0 * flow_scale) / m_per_deg * width_scale, MIN_HW_DISPLAY_DEG)
+            lon, lat = _to_lonlat(node.x + src_x, node.y + src_y)
+            circle = mpatches.Circle((lon, lat), radius=hw_node,
+                                     facecolor=color, edgecolor='none',
+                                     alpha=alpha, zorder=3)
+            ax.add_patch(circle)
+
+        # ── source node disc (covers trunk convergence point) ─────────────────
+        hw_source = max((nodes[0].width / 2.0 * flow_scale) / m_per_deg * width_scale, MIN_HW_DISPLAY_DEG)
+        circle_src = mpatches.Circle((src_lon, src_lat), radius=hw_source,
+                                     facecolor=color, edgecolor='none',
+                                     alpha=alpha, zorder=4)
+        ax.add_patch(circle_src)
+
+        # ── source marker (square icon on top of disc) ────────────────────────
         sz = max(3.0, 4 + 10 * flow_scale * width_scale)
         ax.plot(src_lon, src_lat, 's', color=color,
                 markersize=sz, markeredgecolor='white',
