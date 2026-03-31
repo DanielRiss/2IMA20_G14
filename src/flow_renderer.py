@@ -106,7 +106,7 @@ def render_to_axes(
             # Use caller-supplied trees (e.g. after inter-tree optimisation)
             trees = precomputed_trees
         else:
-            cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode, exponent, disparity_alpha)
+            cache_key = (frozenset(sources), alpha_deg, threshold_meur, net_mode, exponent, disparity_alpha, width_scale)
             if cache_key not in _SPIRAL_CACHE:
                 trees = []
                 # Build in descending total-flow order so the highest-volume tree
@@ -150,6 +150,7 @@ def render_to_axes(
                         alpha_deg=alpha_deg,
                         exponent=exponent,
                         prior_obstacles=prior_obstacles,
+                        width_scale=width_scale,
                     )
                     built_trees.append((result, new_sx, new_sy))
                     trees.append(result)

@@ -567,6 +567,7 @@ def compute_spiral_tree(
     alpha_deg: float = 25.0,
     exponent: float = 0.5,
     prior_obstacles: Optional[List[Tuple[float, float, float]]] = None,
+    width_scale: float = 1.0,
 ) -> SpiralTreeResult:
     """Compute a spiral tree for one source country."""
     tan_a = math.tan(math.radians(alpha_deg))
@@ -616,7 +617,7 @@ def compute_spiral_tree(
             continue
         olon, olat = centroids[obs_name]
         ox, oy     = _to3035(olon, olat)
-        obstacles.append((ox - sx, oy - sy, OBSTACLE_RADIUS_M))
+        obstacles.append((ox - sx, oy - sy, OBSTACLE_RADIUS_M * width_scale))
     for name, flow, R, phi, dx, dy in raw_terminals:
         obstacles.append((dx, dy, LEAF_OBSTACLE_M))
     if prior_obstacles:
@@ -726,7 +727,7 @@ def draw_spiral_trees(
         for node in nodes.values():
             if not node.is_steiner or node.parent is None:
                 continue
-            hw_node = max((node.width / 2.0 * flow_scale) / m_per_deg * width_scale, MIN_HW_DISPLAY_DEG)
+            hw_node = max((node.width / 2.0 * flow_scale) / m_per_deg, MIN_HW_DISPLAY_DEG)
             lon, lat = _to_lonlat(node.x + src_x, node.y + src_y)
             circle = mpatches.Circle((lon, lat), radius=hw_node,
                                      facecolor=color, edgecolor='none',
@@ -734,26 +735,27 @@ def draw_spiral_trees(
             ax.add_patch(circle)
 
         # ── source node disc (covers trunk convergence point) ─────────────────
-        hw_source = max((nodes[0].width / 2.0 * flow_scale) / m_per_deg * width_scale, MIN_HW_DISPLAY_DEG)
+        hw_source = max((nodes[0].width / 2.0 * flow_scale) / m_per_deg, MIN_HW_DISPLAY_DEG)
         circle_src = mpatches.Circle((src_lon, src_lat), radius=hw_source,
                                      facecolor=color, edgecolor='none',
                                      alpha=alpha, zorder=4)
         ax.add_patch(circle_src)
 
         # ── source marker (square icon on top of disc) ────────────────────────
-        sz = max(3.0, 4 + 10 * flow_scale * width_scale)
+        sz = max(3.0, 4 + 10 * flow_scale)
         ax.plot(src_lon, src_lat, 's', color=color,
                 markersize=sz, markeredgecolor='white',
                 markeredgewidth=1.2, zorder=6)
 
-        # ── leaf markers ─────────────────────────────────────────────────────
+        # ── leaf markers (proportional circles, data-space) ──────────────────
         for nid, node in nodes.items():
             if node.is_leaf and node.country and node.country in centroids:
                 lon, lat = centroids[node.country]
-                r = max(2.0, (2 + 6 * node.width / max_w) * flow_scale * width_scale)
-                ax.plot(lon, lat, 'o', color=color,
-                        markersize=r, markeredgecolor='white',
-                        markeredgewidth=0.7, alpha=0.85, zorder=5)
+                hw_leaf = max((node.width / 2.0 * flow_scale) / m_per_deg, MIN_HW_DISPLAY_DEG)
+                circle_leaf = mpatches.Circle((lon, lat), radius=hw_leaf,
+                                             facecolor=color, edgecolor='white',
+                                             linewidth=0.7, alpha=0.85, zorder=5)
+                ax.add_patch(circle_leaf)
 
         ax.text(src_lon, src_lat + 1.5, tree.source_name,
                 ha='center', va='bottom', fontsize=7, fontweight='bold',
@@ -1045,8 +1047,8 @@ def count_crossings(trees: List[SpiralTreeResult]):
 # positions while keeping leaf nodes and source positions fixed.
 
 DEFAULT_OPT_WEIGHTS: dict = {
-    'c_cross':   2.0,
-    'c_overlap': 2.0,
+    'c_cross':   0.0,
+    'c_overlap': 0.0,
 }
 
 DEFAULT_F_TOTAL_WEIGHTS: dict = {
@@ -1353,10 +1355,12 @@ def compute_f_total(
         total += w['c_str']  * compute_f_str(tree)
 
     total_viz_flow = sum(t.total_flow for t in trees) or 1.0
-    total += w['c_cross']   * compute_f_cross(trees)
-    total += w['c_overlap'] * compute_f_overlap(
-        trees, total_viz_flow, centroids, B=B_obs, n_samples=n_overlap_samples
-    )
+    if w['c_cross'] > 0:
+        total += w['c_cross'] * compute_f_cross(trees)
+    if w['c_overlap'] > 0:
+        total += w['c_overlap'] * compute_f_overlap(
+            trees, total_viz_flow, centroids, B=B_obs, n_samples=n_overlap_samples
+        )
 
     return total
 
@@ -1412,7 +1416,7 @@ def optimize_multi_tree(
     stop_event: _threading.Event,
     on_update: Callable[[int, float, List['SpiralTreeResult']], None],
     weights: Optional[dict] = None,
-    max_iter: int = 2000,
+    max_iter: int = 5000,
     T_init: float = 5.0,
     T_min: float  = 1e-3,
     update_every: int = 10,
@@ -1475,7 +1479,7 @@ def optimize_multi_tree(
     # Fix 3: calibrate T_init dynamically so a 1%-of-F_total uphill move
     # has ~25% acceptance probability at t=0.
     # T = -delta / ln(p)  =>  T = (0.01 * F) / ln(4)
-    T_init = (0.01 * current_cost) / math.log(1.0 / 0.25)
+    T_init = (0.07 * current_cost) / math.log(1.0 / 0.25)
     alpha  = (T_min / T_init) ** (1.0 / max(max_iter, 1))
     T      = T_init
 
@@ -1583,7 +1587,7 @@ def optimize_multi_tree(
             # exceeds 50% of the node's current radius.
             ox, oy     = orig_positions[(ti, nid)]
             cumul_disp = math.hypot(node.x - ox, node.y - oy)
-            if cumul_disp > node.R * 0.5:
+            if cumul_disp > node.R * 1.0:
                 node.x, node.y, node.R, node.phi = orig_pos
                 for i, pts in orig_edges.items():
                     tree.edge_polylines[i] = pts

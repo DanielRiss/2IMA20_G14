@@ -450,7 +450,9 @@ class FlowMapApp:
         self._opt_body = ttk.Frame(of)
         # body is NOT packed here — collapsed by default
 
-        # Weight sliders (compact, two columns)
+        # Inter-tree weight entries (0 = disabled by default)
+        ttk.Label(self._opt_body, text="Inter-tree weights (0 = disabled):").pack(
+            anchor='w', pady=(0, 1))
         wf = ttk.Frame(self._opt_body)
         wf.pack(fill='x', pady=(0, 3))
         self._opt_weight_vars: dict = {}
@@ -466,7 +468,7 @@ class FlowMapApp:
         iter_f = ttk.Frame(self._opt_body)
         iter_f.pack(fill='x', pady=(0, 3))
         ttk.Label(iter_f, text="Max iter:").pack(side='left')
-        self._opt_maxiter_var = tk.IntVar(value=2000)
+        self._opt_maxiter_var = tk.IntVar(value=5000)
         ttk.Entry(iter_f, textvariable=self._opt_maxiter_var, width=6).pack(
             side='left', padx=(2, 0))
 

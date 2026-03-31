@@ -162,24 +162,6 @@ def render_basemap(
         eu_gdf.plot(ax=ax, color='#f0f4e8', edgecolor='#888888',
                     linewidth=0.5, zorder=2)
 
-    # ── ISO-2 labels ──────────────────────────────────────────────────────
-    centroids = get_centroids(eu_gdf)
-    short_to_iso = {v: k for k, v in ISO_SHORT.items()}
-    x0, x1 = xlim
-    y0, y1 = ylim
-    pad = 3.0
-    for name, (cx, cy) in centroids.items():
-        if x0 - pad < cx < x1 + pad and y0 - pad < cy < y1 + pad:
-            iso = short_to_iso.get(name, '')
-            if iso:
-                ax.text(
-                    cx, cy, iso,
-                    ha='center', va='center',
-                    fontsize=5.5, color='#444444',
-                    fontfamily='monospace', alpha=0.85,
-                    zorder=4,
-                )
-
     # ── 10° graticule ─────────────────────────────────────────────────────
     for lon in range(-30, 51, 10):
         ax.axvline(lon, color='#aabbcc', linewidth=0.25, linestyle='--',
