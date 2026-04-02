@@ -112,7 +112,7 @@ def get_centroids(eu_gdf: gpd.GeoDataFrame) -> dict:
     for _, row in eu_gdf.iterrows():
         name = row.get('name_short')
         if name:
-            c = row['geometry'].centroid
+            c = row['geometry'].representative_point()
             centroids[name] = (c.x, c.y)
     for name, xy in CENTROID_OVERRIDES.items():
         centroids[name] = xy
@@ -139,7 +139,8 @@ def render_basemap(
                            (e.g. currently selected source countries)
     xlim, ylim           : geographic bounding box [lon, lat]
     """
-    ax.set_facecolor('#c8dff0')   # ocean blue
+    ax.figure.patch.set_facecolor("#e0eef9")  # figure background
+    ax.set_facecolor("#e0eef9")               # axes/ocean background
 
     # ── non-EU context countries ─────────────────────────────────────────
     if world_gdf is not None:

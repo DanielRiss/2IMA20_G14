@@ -65,6 +65,7 @@ def render_to_axes(
     width_scale=1.0,
     exponent=0.5,
     disparity_alpha=0.15,
+    show_labels=False,
 ) -> list:
     """
     Draw a multi-source flow map onto an existing matplotlib Axes.
@@ -159,7 +160,8 @@ def render_to_axes(
                 trees = _SPIRAL_CACHE[cache_key]
 
         draw_spiral_trees(ax, trees, centroids, color_map,
-                          width_scale=width_scale, exponent=exponent)
+                          width_scale=width_scale, exponent=exponent,
+                          show_labels=show_labels)
 
         legend_elements = [
             Line2D([0], [0], color=color_map[src], linewidth=2.5, label=src)

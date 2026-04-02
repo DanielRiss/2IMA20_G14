@@ -7,7 +7,8 @@ And: Buchin, Speckmann & Verbeek (2011). "Angle-Restricted Steiner Arborescences
 for Flow Map Layout." EuroCG 2011.
 
 Public API
-----------
+----------hw_source = max((nodes[0].width / 2.0 * flow_scale) / m_per_deg * 2.0,
+                    MIN_HW_DISPLAY_DEG * 2.0)
 compute_spiral_tree(source, terminal_list, net_flows, centroids, obstacle_list, alpha_deg)
     -> SpiralTreeResult
 
@@ -23,6 +24,7 @@ from __future__ import annotations
 import copy as _copy
 import math
 import heapq
+from collections import defaultdict
 import bisect
 import random as _random
 import threading as _threading
@@ -41,7 +43,7 @@ _FWD = Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
 _INV = Transformer.from_crs("EPSG:3035", "EPSG:4326", always_xy=True)
 
 EU_EXTENT_M        = 4_000_000.0
-MAX_DISPLAY_W_M    = EU_EXTENT_M * 0.012   # ≈48 000 m
+MAX_DISPLAY_W_M    = EU_EXTENT_M * 0.020   # ≈80 000 m
 OBSTACLE_RADIUS_M  = 150_000.0
 LEAF_OBSTACLE_M    =  30_000.0
 N_SPIRAL_SAMPLES   = 40
@@ -664,6 +666,7 @@ def draw_spiral_trees(
     alpha: float = 1.0,
     width_scale: float = 1.0,
     exponent: float = 0.5,
+    show_labels: bool = False,
 ) -> None:
     """Draw all spiral trees onto ax (lon/lat coordinate space).
 
@@ -689,6 +692,19 @@ def draw_spiral_trees(
     m_per_deg  = 111_000.0
 
     sorted_trees = sorted(trees, key=lambda t: t.total_flow, reverse=True)
+
+    # Pre-compute per-country flow list for concentric ring logic (Fix 3)
+    leaf_flows: dict = defaultdict(list)
+    for tree_obj in sorted_trees:
+        flow_scale_obj = (tree_obj.total_flow / total_viz_flow) ** exponent
+        for node_obj in tree_obj.tree_nodes.values():
+            if node_obj.is_leaf and node_obj.country:
+                leaf_flows[node_obj.country].append(
+                    (node_obj.width * flow_scale_obj,
+                     color_map.get(tree_obj.source_name, '#333333'))
+                )
+    for country in leaf_flows:
+        leaf_flows[country].sort(reverse=True)
 
     for tree in sorted_trees:
         if not tree.edges:
@@ -734,33 +750,78 @@ def draw_spiral_trees(
                                      alpha=alpha, zorder=3)
             ax.add_patch(circle)
 
-        # ── source node disc (covers trunk convergence point) ─────────────────
-        hw_source = max((nodes[0].width / 2.0 * flow_scale) / m_per_deg, MIN_HW_DISPLAY_DEG)
-        circle_src = mpatches.Circle((src_lon, src_lat), radius=hw_source,
-                                     facecolor=color, edgecolor='none',
-                                     alpha=alpha, zorder=4)
-        ax.add_patch(circle_src)
+        # ── source node: filled square proportional to total flow ────────────
+        hw_source = max((nodes[0].width / 2.0 * flow_scale) / m_per_deg * 1.2 * width_scale,
+                        MIN_HW_DISPLAY_DEG)
+        square = mpatches.FancyBboxPatch(
+            (src_lon - hw_source, src_lat - hw_source),
+            2 * hw_source, 2 * hw_source,
+            boxstyle='square,pad=0',
+            facecolor=color, edgecolor='white',
+            linewidth=1.2, alpha=alpha, zorder=6
+        )
+        ax.add_patch(square)
 
-        # ── source marker (square icon on top of disc) ────────────────────────
-        sz = max(3.0, 4 + 10 * flow_scale)
-        ax.plot(src_lon, src_lat, 's', color=color,
-                markersize=sz, markeredgecolor='white',
-                markeredgewidth=1.2, zorder=6)
-
-        # ── leaf markers (proportional circles, data-space) ──────────────────
+        # ── leaf markers: proportional circles (Verbeek et al. §4.4) ─────────
         for nid, node in nodes.items():
             if node.is_leaf and node.country and node.country in centroids:
                 lon, lat = centroids[node.country]
-                hw_leaf = max((node.width / 2.0 * flow_scale) / m_per_deg, MIN_HW_DISPLAY_DEG)
-                circle_leaf = mpatches.Circle((lon, lat), radius=hw_leaf,
-                                             facecolor=color, edgecolor='white',
-                                             linewidth=0.7, alpha=0.85, zorder=5)
-                ax.add_patch(circle_leaf)
+                hw_leaf = max((node.width / 2.0 * flow_scale) / m_per_deg * 2.0 * width_scale,
+                              MIN_HW_DISPLAY_DEG * 2.0)
+                this_flow = node.width * flow_scale
+                flows_for_country = leaf_flows.get(node.country, [])
+                rank = sum(1 for f, _ in flows_for_country if f > this_flow)
+                if rank == 0:
+                    circle_leaf = mpatches.Circle(
+                        (lon, lat), radius=hw_leaf,
+                        facecolor=color, edgecolor='white',
+                        linewidth=0.7, alpha=1.0, zorder=5)
+                    ax.add_patch(circle_leaf)
+                else:
+                    ring_radius = hw_leaf + hw_leaf * 0.4 * rank
+                    ring = mpatches.Circle(
+                        (lon, lat), radius=ring_radius,
+                        facecolor='none', edgecolor=color,
+                        linewidth=2.0, alpha=1.0, zorder=5)
+                    ax.add_patch(ring)
 
-        ax.text(src_lon, src_lat + 1.5, tree.source_name,
-                ha='center', va='bottom', fontsize=7, fontweight='bold',
-                zorder=7, color=color,
-                bbox=dict(boxstyle='round,pad=0.12', fc='white', alpha=0.7, lw=0))
+        if show_labels:
+            ax.text(src_lon, src_lat + 1.5, tree.source_name,
+                    ha='center', va='bottom', fontsize=7, fontweight='bold',
+                    zorder=7, color=color,
+                    bbox=dict(boxstyle='round,pad=0.12', fc='white', alpha=0.7, lw=0))
+
+        # ── mid-edge arrows for source-to-source flows only ──────────────────
+        source_names = {t.source_name for t in trees}
+        for (child_id, parent_id), pts in zip(tree.edges, tree.edge_polylines):
+            node = nodes[child_id]
+            if not (node.is_leaf and node.country in source_names):
+                continue
+            if len(pts) < 4:
+                continue
+            mid = len(pts) // 2
+            dx = pts[mid][0] - pts[mid - 1][0]
+            dy = pts[mid][1] - pts[mid - 1][1]
+            length = math.hypot(dx, dy)
+            if length < 1e-9:
+                continue
+            dx /= length
+            dy /= length
+            hw_edge = max((node.width / 2.0 * flow_scale) / m_per_deg,
+                          MIN_HW_DISPLAY_DEG)
+            arrow_len = hw_edge * 2.0
+            half_w    = hw_edge * 0.8
+            mx, my = pts[mid]
+            tip    = (mx + dx * arrow_len, my + dy * arrow_len)
+            base_c = (mx - dx * arrow_len, my - dy * arrow_len)
+            px, py = -dy, dx
+            left   = (base_c[0] + px * half_w, base_c[1] + py * half_w)
+            right  = (base_c[0] - px * half_w, base_c[1] - py * half_w)
+            arrow  = mpatches.Polygon(
+                [tip, left, right], closed=True,
+                facecolor=color, edgecolor='none',
+                alpha=0.9, zorder=4)
+            ax.add_patch(arrow)
 
 
 # ── standalone single-tree cost functions ────────────────────────────────────
@@ -1325,6 +1386,99 @@ def compute_inter_tree_cost(
 # F_total = c_obs*F_obs + c_S*F_S + c_AR*(F_AR+F_B) + c_str*F_str + c_cross*F_cross + c_overlap*F_overlap
 # Removing or zeroing any term is incorrect.
 
+def _partial_f_cross(
+    edge_polys: List[List[Tuple[float, float]]],
+    other_trees: List['SpiralTreeResult'],
+) -> float:
+    """F_cross contribution of `edge_polys` against all edges of `other_trees`.
+
+    Used for delta-cost updates: subtract old contribution, add new contribution.
+    edge_polys: list of polyline point-lists for the incident edges of the moved node.
+    other_trees: all trees EXCEPT the one being perturbed.
+    """
+    eps = 1e-6
+    cost = 0.0
+    for pts_a in edge_polys:
+        if len(pts_a) < 2:
+            continue
+        arr_a = np.asarray(pts_a, dtype=float)
+        for ot in other_trees:
+            for pts_b in ot.edge_polylines:
+                if len(pts_b) < 2:
+                    continue
+                arr_b = np.asarray(pts_b, dtype=float)
+                rows, cols = _seg_cross_batch(arr_a, arr_b)
+                for i, j in zip(rows, cols):
+                    da = arr_a[i + 1] - arr_a[i]
+                    db = arr_b[j + 1] - arr_b[j]
+                    na, nb = np.linalg.norm(da), np.linalg.norm(db)
+                    if na < eps or nb < eps:
+                        cost += 1.0 / eps
+                        continue
+                    cos_g = abs(float(np.dot(da / na, db / nb)))
+                    sin_g = math.sqrt(max(0.0, 1.0 - min(cos_g, 1.0) ** 2))
+                    cost += 1.0 / max(sin_g, eps)
+    return cost
+
+
+def _partial_f_overlap(
+    edge_polys: List[List[Tuple[float, float]]],
+    edge_child_widths: List[float],
+    other_trees: List['SpiralTreeResult'],
+    shared_lonlat: np.ndarray,
+    n_samples: int,
+    B: float,
+) -> float:
+    """F_overlap contribution of `edge_polys` (from one perturbed tree)
+    against all edges of `other_trees`.
+
+    edge_polys: polylines for incident edges.
+    edge_child_widths: half-width in degrees for each edge (same order as edge_polys).
+    other_trees: all trees except the perturbed one.
+    shared_lonlat: (K,2) array of shared-leaf lon/lat positions (pre-computed).
+    """
+    # Pre-stack segments for other trees
+    other_segs: List[Optional[tuple]] = []
+    for ot in other_trees:
+        a_list, b_list = [], []
+        for pts in ot.edge_polylines:
+            if len(pts) < 2:
+                continue
+            arr = np.asarray(pts, dtype=float)
+            a_list.append(arr[:-1])
+            b_list.append(arr[1:])
+        other_segs.append(
+            (np.vstack(a_list), np.vstack(b_list)) if a_list else None
+        )
+
+    cost = 0.0
+    for pts, t in zip(edge_polys, edge_child_widths):
+        if len(pts) < 2 or t <= 0:
+            continue
+        arr = np.asarray(pts, dtype=float)
+        idx = np.round(np.linspace(0, len(arr) - 1, n_samples)).astype(int)
+        samples = arr[idx]
+        if shared_lonlat.shape[0] > 0:
+            dist_to_shared = np.min(
+                np.hypot(
+                    samples[:, 0:1] - shared_lonlat[:, 0],
+                    samples[:, 1:2] - shared_lonlat[:, 1],
+                ),
+                axis=1,
+            )
+            samples = samples[dist_to_shared >= t]
+        if len(samples) == 0:
+            continue
+        for segs in other_segs:
+            if segs is None:
+                continue
+            seg_a, seg_b = segs
+            D = _pts_to_segs_min_dist(samples, seg_a, seg_b)
+            D = np.maximum(D, t * 0.1)
+            cost += float(np.sum(_f_obs_kernel(D, t, B)))
+    return cost
+
+
 def compute_f_total(
     trees: List[SpiralTreeResult],
     centroids: Dict[str, Tuple[float, float]],
@@ -1424,7 +1578,10 @@ def optimize_multi_tree(
     B_obs: float = _OPT_OVERLAP_B,
     n_overlap_samples: int = 6,
     gd_iters: int = 200,
-) -> None:
+    exponent: float = 0.5,
+    width_scale: float = 1.0,
+    result_dict: Optional[dict] = None,
+) -> int:
     """Simulated annealing to reduce inter-tree crossings and overlaps.
 
     Runs in a background thread.  Calls
@@ -1462,6 +1619,13 @@ def optimize_multi_tree(
         on_update(-1, 0.0, state)
         return
 
+    # Diagnostic counters
+    _diag_sa_accepted       = 0
+    _diag_sa_total          = 0
+    _diag_greedy_accepted   = 0
+    _diag_intra_reverts     = 0
+    _diag_disp_reverts      = 0
+
     # Store original (x, y) of every Steiner node for cumulative displacement constraint
     orig_positions: Dict[Tuple[int, int], Tuple[float, float]] = {
         (ti, nid): (node.x, node.y)
@@ -1472,10 +1636,30 @@ def optimize_multi_tree(
 
     total_viz_flow = sum(t.total_flow for t in state) or 1.0
 
+    # Pre-compute shared leaf positions for overlap delta (shared across all iterations)
+    from collections import Counter as _Counter
+    _country_count = _Counter(
+        node.country
+        for tree in state
+        for node in tree.tree_nodes.values()
+        if node.is_leaf and node.country
+    )
+    _shared_lonlat = np.array(
+        [centroids[c] for c, cnt in _country_count.items() if cnt >= 2 and c in centroids],
+        dtype=float,
+    )
+
     def _full_cost() -> float:
         return compute_f_total(state, centroids, alpha_deg, w, B_obs, n_overlap_samples)
 
     current_cost = _full_cost()
+    # Cache running inter-tree costs for delta updates when weights > 0
+    _use_cross_delta   = w['c_cross']   > 0
+    _use_overlap_delta = w['c_overlap'] > 0
+    _cur_f_cross   = compute_f_cross(state)   if _use_cross_delta   else 0.0
+    _cur_f_overlap = compute_f_overlap(
+        state, total_viz_flow, centroids, B=B_obs, n_samples=n_overlap_samples
+    ) if _use_overlap_delta else 0.0
     # Fix 3: calibrate T_init dynamically so a 1%-of-F_total uphill move
     # has ~25% acceptance probability at t=0.
     # T = -delta / ln(p)  =>  T = (0.01 * F) / ln(4)
@@ -1491,6 +1675,9 @@ def optimize_multi_tree(
         if it == max_iter:
             T = 1e-15
 
+        if it < max_iter:
+            _diag_sa_total += 1
+
         ti, nid = _random.choice(steiner_pool)
         tree     = state[ti]
         node     = tree.tree_nodes[nid]
@@ -1499,7 +1686,7 @@ def optimize_multi_tree(
         # All pool nodes are join nodes — free translation in (x, y)
         # Step size scales with t_frac = T/T_init (large early, fine late)
         t_frac = T / T_init
-        step  = max(node.R * 0.10 * t_frac, 500.0)
+        step  = max(node.R * 0.03 * t_frac, 500.0)
         new_x = node.x + _random.gauss(0.0, step)
         new_y = node.y + _random.gauss(0.0, step)
         new_R, new_phi = _polar(new_x, new_y)
@@ -1537,6 +1724,17 @@ def optimize_multi_tree(
             if c == nid or p == nid
         }
 
+        # For delta-cost: collect old incident polylines and their child widths
+        # before applying the move (used by partial cost helpers)
+        _other_trees = [state[j] for j in range(len(state)) if j != ti]
+        if _use_cross_delta or _use_overlap_delta:
+            _old_polys = [tree.edge_polylines[i] for i in orig_edges]
+            if _use_overlap_delta:
+                _old_widths = [
+                    (tree.tree_nodes[tree.edges[i][0]].width / 2.0) / _OPT_M_PER_DEG
+                    for i in orig_edges
+                ]
+
         # Apply perturbation
         node.x, node.y, node.R, node.phi = new_x, new_y, new_R, new_phi
         for i in orig_edges:
@@ -1545,7 +1743,42 @@ def optimize_multi_tree(
             new_pts = _sample_spiral(cn.R, cn.phi, pn.R, pn.phi, sx, sy)
             tree.edge_polylines[i] = new_pts if new_pts else orig_edges[i]
 
-        new_cost = _full_cost()
+        # Compute new cost: reuse full cost for intra-tree terms;
+        # for inter-tree terms use delta updates when weights > 0
+        if _use_cross_delta or _use_overlap_delta:
+            _new_polys = [tree.edge_polylines[i] for i in orig_edges]
+            if _use_overlap_delta:
+                _new_widths = _old_widths  # widths unchanged (node.width not moved)
+
+            _new_f_cross = _cur_f_cross
+            if _use_cross_delta:
+                _new_f_cross = (
+                    _cur_f_cross
+                    - _partial_f_cross(_old_polys, _other_trees)
+                    + _partial_f_cross(_new_polys, _other_trees)
+                )
+
+            _new_f_overlap = _cur_f_overlap
+            if _use_overlap_delta:
+                _new_f_overlap = (
+                    _cur_f_overlap
+                    - _partial_f_overlap(_old_polys, _old_widths, _other_trees,
+                                         _shared_lonlat, n_overlap_samples, B_obs)
+                    + _partial_f_overlap(_new_polys, _new_widths, _other_trees,
+                                         _shared_lonlat, n_overlap_samples, B_obs)
+                )
+
+            # Full cost = intra-tree terms (recomputed) + cached inter-tree terms
+            _intra_cost = compute_f_total(
+                state, centroids, alpha_deg,
+                {**w, 'c_cross': 0.0, 'c_overlap': 0.0},
+                B_obs, n_overlap_samples,
+            )
+            new_cost = (_intra_cost
+                        + w['c_cross']   * _new_f_cross
+                        + w['c_overlap'] * _new_f_overlap)
+        else:
+            new_cost = _full_cost()
         delta    = new_cost - current_cost
 
         # Metropolis acceptance criterion
@@ -1559,24 +1792,49 @@ def optimize_multi_tree(
             ]
             new_intra = False
             if _LineString is not None:
+                flow_scale_tree = (tree.total_flow / total_viz_flow) ** exponent
+                # build non-incident polygons once (unchanged edges)
+                non_incident_polys = {}
+                for bi in non_incident_idx:
+                    pts_b = tree.edge_polylines[bi]
+                    if len(pts_b) < 2:
+                        continue
+                    child_b = tree.edges[bi][0]
+                    hw_b = max(
+                        (tree.tree_nodes[child_b].width / 2.0 * flow_scale_tree) / _OPT_M_PER_DEG * width_scale,
+                        MIN_HW_DISPLAY_DEG,
+                    )
+                    try:
+                        non_incident_polys[bi] = _LineString(pts_b).buffer(
+                            hw_b, cap_style=2, join_style=2)
+                    except Exception:
+                        continue
+
                 for ai in incident_idx:
                     if len(tree.edge_polylines[ai]) < 2:
                         continue
-                    line_a      = _LineString(tree.edge_polylines[ai])  # post-move
-                    orig_line_a = _LineString(orig_edges[ai])           # pre-move
-                    for bi in non_incident_idx:
-                        line_b = _LineString(tree.edge_polylines[bi])   # unchanged
-                        try:
-                            crosses_after  = line_a.crosses(line_b)
-                            crosses_before = orig_line_a.crosses(line_b)
-                        except Exception:
-                            continue
-                        if crosses_after and not crosses_before:
+                    child_a = tree.edges[ai][0]
+                    hw_a = max(
+                        (tree.tree_nodes[child_a].width / 2.0 * flow_scale_tree) / _OPT_M_PER_DEG * width_scale,
+                        MIN_HW_DISPLAY_DEG,
+                    )
+                    try:
+                        poly_after  = _LineString(tree.edge_polylines[ai]).buffer(
+                            hw_a, cap_style=2, join_style=2)
+                        poly_before = _LineString(orig_edges[ai]).buffer(
+                            hw_a, cap_style=2, join_style=2)
+                    except Exception:
+                        continue
+                    for bi, poly_b in non_incident_polys.items():
+                        overlaps_after  = poly_after.intersects(poly_b)
+                        overlaps_before = poly_before.intersects(poly_b)
+                        if overlaps_after and not overlaps_before:
                             new_intra = True
                             break
                     if new_intra:
                         break
             if new_intra:
+                _diag_intra_reverts += 1
                 node.x, node.y, node.R, node.phi = orig_pos
                 for i, pts in orig_edges.items():
                     tree.edge_polylines[i] = pts
@@ -1587,7 +1845,8 @@ def optimize_multi_tree(
             # exceeds 50% of the node's current radius.
             ox, oy     = orig_positions[(ti, nid)]
             cumul_disp = math.hypot(node.x - ox, node.y - oy)
-            if cumul_disp > node.R * 1.0:
+            if cumul_disp > 200_000.0:
+                _diag_disp_reverts += 1
                 node.x, node.y, node.R, node.phi = orig_pos
                 for i, pts in orig_edges.items():
                     tree.edge_polylines[i] = pts
@@ -1595,6 +1854,14 @@ def optimize_multi_tree(
                     T *= alpha
                 continue
             current_cost = new_cost
+            if _use_cross_delta:
+                _cur_f_cross   = _new_f_cross
+            if _use_overlap_delta:
+                _cur_f_overlap = _new_f_overlap
+            if it < max_iter:
+                _diag_sa_accepted += 1
+            else:
+                _diag_greedy_accepted += 1
             # Part 2: analytically smooth subdivision nodes in the affected tree
             _smooth_subdivision_nodes(tree, *src_xy[ti])
         else:
@@ -1609,7 +1876,60 @@ def optimize_multi_tree(
         if (it + 1) % update_every == 0:
             on_update(it + 1, current_cost, _copy.deepcopy(state))
 
+    # ── Post-optimization repair: enforce inter-tree join separation ──────
+    n_repaired = 0
+    R_PRIOR = 50_000.0
+    for ti, tree in enumerate(state):
+        sx_i, sy_i = src_xy[ti]
+        nodes_i = tree.tree_nodes
+        for nid, node in nodes_i.items():
+            if not node.is_steiner or len(node.children) < 2:
+                continue  # join nodes only
+            abs_x = sx_i + node.x
+            abs_y = sy_i + node.y
+            violated = False
+            for tj, other_tree in enumerate(state):
+                if tj == ti:
+                    continue
+                sx_j, sy_j = src_xy[tj]
+                for other_node in other_tree.tree_nodes.values():
+                    ox = sx_j + other_node.x
+                    oy = sy_j + other_node.y
+                    if math.hypot(abs_x - ox, abs_y - oy) < R_PRIOR:
+                        violated = True
+                        break
+                if violated:
+                    break
+            if violated:
+                ox, oy = orig_positions[(ti, nid)]
+                node.x, node.y = ox, oy
+                node.R   = math.hypot(ox, oy)
+                node.phi = math.atan2(oy, ox)
+                for ei, (c, p) in enumerate(tree.edges):
+                    if c == nid or p == nid:
+                        cn = nodes_i[c]
+                        pn = nodes_i[p]
+                        new_pts = _sample_spiral(
+                            cn.R, cn.phi, pn.R, pn.phi, sx_i, sy_i)
+                        if new_pts:
+                            tree.edge_polylines[ei] = new_pts
+                n_repaired += 1
+
+    if n_repaired > 0:
+        for ti, tree in enumerate(state):
+            _smooth_subdivision_nodes(tree, *src_xy[ti])
+
+    if result_dict is not None:
+        result_dict['sa_accepted_moves']       = _diag_sa_accepted
+        result_dict['sa_total_moves']          = _diag_sa_total
+        result_dict['greedy_accepted_moves']   = _diag_greedy_accepted
+        result_dict['displacement_guard_reverts']  = _diag_disp_reverts
+        result_dict['intra_overlap_guard_reverts'] = _diag_intra_reverts
+        result_dict['T_init']                  = T_init
+        result_dict['post_repair_violations']  = n_repaired
+
     on_update(-1, current_cost, state)
+    return n_repaired
 
 
 # ── __main__ standalone test ─────────────────────────────────────────────────
