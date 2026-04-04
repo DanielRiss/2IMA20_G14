@@ -1054,7 +1054,7 @@ DEFAULT_OPT_WEIGHTS: dict = {
 DEFAULT_F_TOTAL_WEIGHTS: dict = {
     'c_obs':     2.0,
     'c_S':       0.4,
-    'c_AR':      0.077,
+    'c_AR':      2.0,
     'c_str':     0.4,
     'c_cross':   0.0,    # disabled: optimizer focuses on single-tree quality only
     'c_overlap': 0.0,    # disabled: inter-tree conflicts not resolved by SA
