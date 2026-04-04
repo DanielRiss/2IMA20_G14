@@ -10,12 +10,14 @@ the portion currently visible in the main view.  "Reset View" snaps back
 to the full EU extent.
 """
 
+import csv
 import os
 import sys
 import threading
+import time
 
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 
 import matplotlib
 matplotlib.use('TkAgg')
@@ -30,7 +32,10 @@ from map_utils import load_eu_map, load_world_map, get_centroids
 from flow_renderer import render_to_axes, invalidate_spiral_cache
 from spiral_tree import (compute_tree_stats, count_crossings,
                          optimize_multi_tree, compute_inter_tree_cost,
-                         DEFAULT_OPT_WEIGHTS)
+                         DEFAULT_OPT_WEIGHTS, DEFAULT_F_TOTAL_WEIGHTS,
+                         compute_f_total, compute_f_cross, compute_f_overlap,
+                         compute_f_obs, compute_f_s, compute_f_ar_and_b,
+                         compute_f_str, _to3035, _OPT_OVERLAP_B)
 from group_utils import DEFAULT_GROUPS, apply_groups
 
 # ── paths ──────────────────────────────────────────────────────────────────────
@@ -121,6 +126,7 @@ class FlowMapApp:
         self.exponent_var       = tk.IntVar(value=50)
         self.threshold_var      = tk.IntVar(value=0)
         self.disparity_alpha_var = tk.DoubleVar(value=0.15)
+        self.show_labels_var = tk.BooleanVar(value=False)
         self.year_var       = tk.StringVar(value=str(AVAILABLE_YEARS[0]))
         self.country_vars   = {c: tk.BooleanVar(value=False) for c in EU27_COUNTRIES}
         self.focus_var      = tk.BooleanVar(value=False)
@@ -143,6 +149,12 @@ class FlowMapApp:
         self._opt_stop:       threading.Event         = threading.Event()
         self._opt_orig_trees: list | None             = None  # snapshot before opt
         self._opt_trees:      list | None             = None  # latest opt result
+        self._opt_diagnostics: dict                   = {}    # filled by optimizer thread
+        self._opt_wall_clock:  float                  = 0.0
+
+        # ── experiment log ──────────────────────────────────────────────────
+        self._experiment_log: list = []
+        self._total_eu_flow:  float = 0.0
 
         self._build_ui()
         self._load_data()
@@ -260,12 +272,19 @@ class FlowMapApp:
         df.pack(fill='x', pady=2)
         self.disparity_label = ttk.Label(df, text="Disparity α: 0.15")
         self.disparity_label.pack(anchor='w')
-        disparity_sl = ttk.Scale(df, from_=0.05, to=0.50,
+        disparity_sl = ttk.Scale(df, from_=0.05, to=1.00,
                                  variable=self.disparity_alpha_var,
                                  orient='horizontal',
                                  command=self._on_disparity_move)
         disparity_sl.pack(fill='x')
         disparity_sl.bind('<ButtonRelease-1>', lambda _e: self._on_disparity_release())
+
+        # Display options
+        disp_f = ttk.LabelFrame(ctrl, text="Display Options", padding=4)
+        disp_f.pack(fill='x', pady=2)
+        ttk.Checkbutton(disp_f, text="Show country labels",
+                        variable=self.show_labels_var,
+                        command=self._do_redraw).pack(anchor='w')
 
         # Country groups
         self.groups_outer = ttk.LabelFrame(ctrl, text="Country Groups", padding=4)
@@ -323,6 +342,9 @@ class FlowMapApp:
 
         # Multi-tree optimizer panel
         self._build_opt_panel(ctrl)
+
+        # Experiment log panel
+        self._build_exp_panel(ctrl)
 
         # Action buttons
         af = ttk.Frame(ctrl)
@@ -491,6 +513,36 @@ class FlowMapApp:
                   foreground='#555555', font=('TkDefaultFont', 8),
                   wraplength=240).pack(anchor='w', pady=(2, 0))
 
+    def _build_exp_panel(self, parent: ttk.Frame):
+        exp_frame = ttk.LabelFrame(parent, text="Experiment Log", padding=4)
+        exp_frame.pack(fill='x', pady=2)
+
+        exp_header = ttk.Frame(exp_frame)
+        exp_header.pack(fill='x')
+        self._exp_toggle_btn = ttk.Button(exp_header, text="\u25b6", width=2,
+                                          command=self._toggle_exp_panel)
+        self._exp_toggle_btn.pack(side='right')
+
+        self._exp_body = ttk.Frame(exp_frame)
+        # collapsed by default
+
+        cols   = ('ts', 'src', 'n', 'f_before', 'f_after', 'pct', 'cx_b', 'cx_a', 'secs')
+        heads  = ('Time', 'Sources', 'N', 'F_opt↑', 'F_opt↓', 'Δ%', 'Cross↑', 'Cross↓', 'Sec')
+        widths = (55, 60, 20, 50, 50, 35, 40, 40, 35)
+        self._exp_tv = ttk.Treeview(self._exp_body, columns=cols,
+                                    show='headings', height=5)
+        for col, head, w in zip(cols, heads, widths):
+            self._exp_tv.heading(col, text=head)
+            self._exp_tv.column(col, width=w, anchor='e', stretch=False)
+        self._exp_tv.pack(fill='x', pady=(2, 2))
+
+        btn_row = ttk.Frame(self._exp_body)
+        btn_row.pack(fill='x')
+        ttk.Button(btn_row, text="Export CSV",
+                   command=self._export_exp_csv).pack(side='left', padx=(0, 3))
+        ttk.Button(btn_row, text="Clear Log",
+                   command=self._clear_exp_log).pack(side='left')
+
     # ── optimizer callbacks ──────────────────────────────────────────────────
 
     def _toggle_opt_panel(self):
@@ -517,6 +569,223 @@ class FlowMapApp:
             self._save_body.pack(fill='x', pady=(2, 0))
             self._save_toggle_btn.config(text="\u25bc")
 
+    def _toggle_exp_panel(self):
+        if self._exp_body.winfo_ismapped():
+            self._exp_body.pack_forget()
+            self._exp_toggle_btn.config(text="\u25b6")
+        else:
+            self._exp_body.pack(fill='x', pady=(2, 0))
+            self._exp_toggle_btn.config(text="\u25bc")
+
+    def _compute_tree_metrics(self, trees, alpha_deg):
+        """Compute all per-tree and inter-tree quality metrics for a tree list."""
+        if not trees:
+            return {}
+
+        w_all = {**DEFAULT_F_TOTAL_WEIGHTS}
+        obstacle_map = {}
+        for tree in trees:
+            if tree.source_name in self.centroids:
+                obstacle_map[tree.source_name] = self.centroids[tree.source_name]
+            for node in tree.tree_nodes.values():
+                if node.is_leaf and node.country and node.country in self.centroids:
+                    obstacle_map[node.country] = self.centroids[node.country]
+
+        f_obs = f_S = f_AR = f_B = f_str = 0.0
+        n_leaves = n_join = n_subdiv = n_edges = 0
+        leaves_per_src = {}
+        for tree in trees:
+            sx, sy = _to3035(*self.centroids[tree.source_name])
+            f_obs += w_all['c_obs'] * compute_f_obs(tree, obstacle_map, (sx, sy))
+            f_S   += w_all['c_S']   * compute_f_s(tree)
+            ar, b  = compute_f_ar_and_b(tree, alpha_deg)
+            f_AR  += w_all['c_AR']  * ar
+            f_B   += w_all['c_AR']  * b
+            f_str += w_all['c_str'] * compute_f_str(tree)
+            src_leaves = 0
+            for node in tree.tree_nodes.values():
+                if node.is_leaf:
+                    n_leaves += 1
+                    src_leaves += 1
+                elif node.is_steiner:
+                    if len(node.children) >= 2:
+                        n_join += 1
+                    else:
+                        n_subdiv += 1
+            n_edges += len(tree.edges)
+            leaves_per_src[tree.source_name] = src_leaves
+
+        f_opt = f_obs + f_S + f_AR + f_B + f_str
+        total_viz_flow = sum(t.total_flow for t in trees) or 1.0
+        f_cross   = compute_f_cross(trees)
+        f_overlap = compute_f_overlap(trees, total_viz_flow, self.centroids,
+                                      B=_OPT_OVERLAP_B, n_samples=6)
+        inter_cross, _ = count_crossings(trees)
+        flow_coverage = (sum(t.total_flow for t in trees) / self._total_eu_flow * 100.0
+                         if self._total_eu_flow > 0 else 0.0)
+        leaves_str = ','.join(f"{k}:{v}" for k, v in sorted(leaves_per_src.items()))
+
+        return {
+            'total_flow_coverage_pct':     round(flow_coverage, 2),
+            'n_leaves_total':              n_leaves,
+            'n_join_nodes_total':          n_join,
+            'n_subdivision_nodes_total':   n_subdiv,
+            'n_edges_total':               n_edges,
+            'leaves_per_source':           leaves_str,
+            'f_obs':   round(f_obs,   4),
+            'f_S':     round(f_S,     4),
+            'f_AR':    round(f_AR,    4),
+            'f_B':     round(f_B,     4),
+            'f_str':   round(f_str,   4),
+            'f_opt':   round(f_opt,   4),
+            'f_cross':   round(f_cross,   4),
+            'f_overlap': round(f_overlap, 4),
+            'n_crossings': inter_cross,
+        }
+
+    def _record_experiment(self, trees_before, trees_after, opt_run,
+                           diagnostics=None, wall_clock=None):
+        """Build one experiment row and append to self._experiment_log."""
+        import datetime
+        sources = [c for c, v in self.country_vars.items() if v.get()
+                   if c in (self.centroids or {})]
+        alpha_deg = float(self.alpha_var.get())
+
+        m_before = self._compute_tree_metrics(trees_before, alpha_deg)
+        if opt_run and trees_after is not trees_before:
+            m_after = self._compute_tree_metrics(trees_after, alpha_deg)
+        else:
+            m_after = m_before
+
+        f_b = m_before.get('f_opt', 0.0)
+        f_a = m_after.get('f_opt',  0.0)
+        pct = ((f_b - f_a) / f_b * 100.0) if f_b > 0 else 0.0
+
+        row = {
+            'timestamp':            datetime.datetime.now().strftime('%H:%M:%S'),
+            'sources':              ','.join(sources),
+            'n_sources':            len(sources),
+            'net_mode':             self.data_mode_var.get() == 'net',
+            'disparity_alpha':      round(self.disparity_alpha_var.get(), 3),
+            'threshold_meur':       round(slider_to_threshold(self.threshold_var.get()), 1),
+            'alpha_spiral_deg':     alpha_deg,
+            'exponent_gamma':       round(self.exponent_var.get() / 100.0, 2),
+            'width_scale':          round(self.width_scale_var.get() / 100.0, 2),
+            'opt_n_iter':           self._opt_maxiter_var.get() if opt_run else 0,
+            'opt_c_obs':            DEFAULT_F_TOTAL_WEIGHTS['c_obs'],
+            'opt_c_S':              DEFAULT_F_TOTAL_WEIGHTS['c_S'],
+            'opt_c_AR':             DEFAULT_F_TOTAL_WEIGHTS['c_AR'],
+            'opt_c_str':            DEFAULT_F_TOTAL_WEIGHTS['c_str'],
+            'opt_c_cross':          self._opt_weight_vars['c_cross'].get(),
+            'opt_c_overlap':        self._opt_weight_vars['c_overlap'].get(),
+            'total_flow_coverage_pct':   m_before.get('total_flow_coverage_pct'),
+            'n_leaves_total':            m_before.get('n_leaves_total'),
+            'n_join_nodes_total':        m_before.get('n_join_nodes_total'),
+            'n_subdivision_nodes_total': m_before.get('n_subdivision_nodes_total'),
+            'n_edges_total':             m_before.get('n_edges_total'),
+            'leaves_per_source':         m_before.get('leaves_per_source'),
+            'f_obs_before':    m_before.get('f_obs'),
+            'f_S_before':      m_before.get('f_S'),
+            'f_AR_before':     m_before.get('f_AR'),
+            'f_B_before':      m_before.get('f_B'),
+            'f_str_before':    m_before.get('f_str'),
+            'f_opt_before':    f_b,
+            'f_cross_before':  m_before.get('f_cross'),
+            'f_overlap_before':m_before.get('f_overlap'),
+            'n_crossings_before': m_before.get('n_crossings'),
+            'f_obs_after':    m_after.get('f_obs'),
+            'f_S_after':      m_after.get('f_S'),
+            'f_AR_after':     m_after.get('f_AR'),
+            'f_B_after':      m_after.get('f_B'),
+            'f_str_after':    m_after.get('f_str'),
+            'f_opt_after':    f_a,
+            'f_opt_reduction_pct': round(pct, 2),
+            'f_cross_after':   m_after.get('f_cross'),
+            'f_overlap_after': m_after.get('f_overlap'),
+            'n_crossings_after': m_after.get('n_crossings'),
+            'sa_accepted_moves':          (diagnostics or {}).get('sa_accepted_moves'),
+            'sa_total_moves':             (diagnostics or {}).get('sa_total_moves'),
+            'sa_acceptance_rate_pct':     (
+                round(diagnostics['sa_accepted_moves'] / diagnostics['sa_total_moves'] * 100, 1)
+                if diagnostics and diagnostics.get('sa_total_moves')
+                else None),
+            'greedy_accepted_moves':      (diagnostics or {}).get('greedy_accepted_moves'),
+            'displacement_guard_reverts': (diagnostics or {}).get('displacement_guard_reverts'),
+            'intra_overlap_guard_reverts':(diagnostics or {}).get('intra_overlap_guard_reverts'),
+            'post_repair_violations':     (diagnostics or {}).get('post_repair_violations'),
+            'wall_clock_seconds':         round(wall_clock, 1) if wall_clock is not None else None,
+            'T_init':                     (diagnostics or {}).get('T_init'),
+        }
+
+        self._experiment_log.append(row)
+        self._refresh_exp_table()
+
+    def _refresh_exp_table(self):
+        for item in self._exp_tv.get_children():
+            self._exp_tv.delete(item)
+        for row in self._experiment_log[-10:]:
+            f_b = row.get('f_opt_before', '')
+            f_a = row.get('f_opt_after',  '')
+            pct = row.get('f_opt_reduction_pct', '')
+            cx_b = row.get('n_crossings_before', '')
+            cx_a = row.get('n_crossings_after',  '')
+            secs = row.get('wall_clock_seconds', '')
+            self._exp_tv.insert('', 'end', values=(
+                row.get('timestamp', ''),
+                row.get('sources', '')[:12],
+                row.get('n_sources', ''),
+                f'{f_b:.2f}' if isinstance(f_b, float) else f_b,
+                f'{f_a:.2f}' if isinstance(f_a, float) else f_a,
+                f'{pct:.1f}' if isinstance(pct, float) else pct,
+                cx_b, cx_a,
+                f'{secs:.1f}' if isinstance(secs, float) else secs,
+            ))
+
+    def _export_exp_csv(self):
+        if not self._experiment_log:
+            messagebox.showinfo("Empty", "No experiment data recorded yet.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension='.csv',
+            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')],
+            title='Export Experiment Log',
+        )
+        if not path:
+            return
+        fieldnames = list(dict.fromkeys(
+            k for row in self._experiment_log for k in row
+        ))
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames,
+                                    extrasaction='ignore', restval='')
+            writer.writeheader()
+            writer.writerows(self._experiment_log)
+        messagebox.showinfo("Exported", f"Saved {len(self._experiment_log)} rows to:\n{path}")
+
+    def _clear_exp_log(self):
+        self._experiment_log.clear()
+        self._refresh_exp_table()
+
+    def _record_opt_interim_row(self, it: int, cost: float):
+        import datetime
+        sources = [c for c, v in self.country_vars.items() if v.get()
+                   if c in (self.centroids or {})]
+        f_start = self._opt_f_start
+        pct = (round((f_start - cost) / f_start * 100.0, 1)
+               if f_start and f_start > 0 else None)
+        row = {
+            'timestamp':        f'\u25b6{datetime.datetime.now().strftime("%H:%M:%S")}',
+            'sources':          ','.join(sources),
+            'n_sources':        len(sources),
+            'opt_n_iter':       it,
+            'f_opt_before':     f_start,
+            'f_opt_after':      round(cost, 4),
+            'f_opt_reduction_pct': pct,
+            '_interim':         True,
+        }
+        self._experiment_log.append(row)
+        self._refresh_exp_table()
+
     def _start_opt(self):
         if not self._current_trees:
             messagebox.showinfo("No trees",
@@ -529,8 +798,10 @@ class FlowMapApp:
 
         # Snapshot the trees before optimizing so Reset can restore them
         import copy
-        self._opt_orig_trees = copy.deepcopy(self._current_trees)
-        self._opt_trees      = None
+        self._opt_orig_trees     = copy.deepcopy(self._current_trees)
+        self._opt_trees          = None
+        self._opt_f_start        = None   # cost at first interim update
+        self._opt_last_log_block = -1     # last 500-iter block logged
 
         self._opt_start_btn.config(state='disabled')
         self._opt_stop_btn.config(state='normal')
@@ -545,8 +816,10 @@ class FlowMapApp:
     def _run_opt_thread(self):
         """Background thread: runs SA optimizer and posts updates to main thread."""
         _, _, centroids = self._get_effective_data()
-        weights = {k: v.get() for k, v in self._opt_weight_vars.items()}
-        max_iter = max(1, self._opt_maxiter_var.get())
+        weights     = {k: v.get() for k, v in self._opt_weight_vars.items()}
+        max_iter    = max(1, self._opt_maxiter_var.get())
+        exponent    = self.exponent_var.get() / 100.0
+        width_scale = self.width_scale_var.get() / 100.0
 
         def _on_update(it, cost, trees):
             # Schedule UI update on the main thread (thread-safe Tkinter API)
@@ -559,7 +832,9 @@ class FlowMapApp:
             except Exception:
                 pass   # root may have been destroyed
 
-        optimize_multi_tree(
+        self._opt_diagnostics = {}
+        _t0 = time.perf_counter()
+        n_repaired = optimize_multi_tree(
             trees=list(self._current_trees),
             centroids=centroids,
             stop_event=self._opt_stop,
@@ -567,7 +842,12 @@ class FlowMapApp:
             weights=weights,
             max_iter=max_iter,
             update_every=max(1, max_iter // 30),   # ~30 visual updates
+            exponent=exponent,
+            width_scale=width_scale,
+            result_dict=self._opt_diagnostics,
         )
+        self._opt_diagnostics['post_repair_violations'] = n_repaired
+        self._opt_wall_clock = time.perf_counter() - _t0
 
     def _apply_opt_update(self, it: int, cost: float, trees: list):
         """Called on main thread; updates display and button states."""
@@ -579,8 +859,21 @@ class FlowMapApp:
             self._opt_start_btn.config(state='normal')
             self._opt_stop_btn.config(state='disabled')
             self._opt_reset_btn.config(state='normal')
+            if self._opt_orig_trees:
+                self._record_experiment(
+                    self._opt_orig_trees, trees,
+                    opt_run=True,
+                    diagnostics=self._opt_diagnostics,
+                    wall_clock=self._opt_wall_clock,
+                )
         else:
             self._opt_status_var.set(f"Iter {it}  |  cost: {cost:.3f}")
+            if self._opt_f_start is None:
+                self._opt_f_start = cost
+            block = it // 500
+            if block > self._opt_last_log_block:
+                self._opt_last_log_block = block
+                self._record_opt_interim_row(it, cost)
 
         self._redraw_with_trees(trees)
         _, net_mx, _ = self._get_effective_data()
@@ -656,6 +949,7 @@ class FlowMapApp:
                 width_scale=self.width_scale_var.get() / 100.0,
                 exponent=self.exponent_var.get() / 100.0,
                 disparity_alpha=self.disparity_alpha_var.get(),
+                show_labels=self.show_labels_var.get(),
             )
             if zoomed:
                 self.ax.set_xlim(old_xlim)
@@ -674,6 +968,7 @@ class FlowMapApp:
             year = int(self.year_var.get())
             self.export_matrix, self.net_matrix, _ = load_trade_data(
                 DATA_FILE, LABEL_FILE, year=year)
+            self._total_eu_flow = float(self.net_matrix.clip(lower=0).sum().sum())
             invalidate_spiral_cache()
 
             if self.eu_gdf is None:
@@ -876,6 +1171,7 @@ class FlowMapApp:
                 width_scale=self.width_scale_var.get() / 100.0,
                 exponent=self.exponent_var.get() / 100.0,
                 disparity_alpha=self.disparity_alpha_var.get(),
+                show_labels=self.show_labels_var.get(),
             )
 
             # Restore zoom (render_to_axes resets to full EU)
@@ -890,6 +1186,9 @@ class FlowMapApp:
 
         self._current_trees = trees
         self._update_stats(trees, net_mx, threshold)
+
+        if spiral_mode and trees:
+            self._record_experiment(trees, trees, opt_run=False)
 
         mode_str  = f"{'net' if net_mode else 'gross'} / {'spiral' if spiral_mode else 'straight'}"
         focus_str = "  [focus]" if (self.focus_var.get() and len(sources) >= 2) else ""
